@@ -1,5 +1,18 @@
-Here is a program that simulates splitting a network stream into a linked list of fixed-size buffers. <br>
-This program processes incoming network data (simulated here as an array of bytes) and stores it in a linked list of fixed-size buffers.<br>
+There is an incoming data stream of unknown length.<br>
+The data are read using the stream_get() function.<br>
+ You must copy the data into a linked list of fixed_buff structures. <br>
+ Each fixed_buff can store up to 32 (FIXED_BUFF_LEN) bytes of data. <br>
+ You should not change FIXED_BUFF_LEN  to other value.<br>
+ 
+Call 1: stream_get() returns curr_data_len == 50 bytes.<br>
+Call 2: stream_get() returns curr_data_len == 20 bytes.<br>
+Call 3: stream_get() returns NULL, so finished reading.<br>
+You should return a linked list of 3 fixed_buffs:<br>
+buff1->buff2->buff3<br>
+buff1 should have the first 32 bytes (data_len == 32)<br>
+buff2 should have the second 32 bytes (data_len == 32) <br>
+buff3 should have the last 6 bytes (data_len == 6)<br>
+
 ```c
 #include <stdio.h>
 #include <stdlib.h>

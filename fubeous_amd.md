@@ -67,3 +67,41 @@ Output
 I am a C Programmer
 Programmer C a am I 
 ```
+
+**Alternate Method**
+```c
+#include <stdio.h>
+#include <string.h>
+
+void reverse_order_print(const char *str) {
+    int length = strlen(str);
+    int end = length - 1;
+    int first_word = 1;
+
+    for (int i = length - 1; i >= 0; i--) {
+        if (str[i] == ' ') {
+            if (end != i) {
+                if (!first_word) {
+                    putchar(' ');
+                }
+                printf("%.*s", end - i, str + i + 1);
+                first_word = 0;
+            }
+            end = i - 1;
+        }
+    }
+    if (end >= 0) {
+        if (!first_word) {
+            putchar(' ');
+        }
+        printf("%.*s", end + 1, str);
+    }
+    printf("\n");
+}
+
+int main() {
+    const char input[] = "I am a C Programmer";
+    reverse_order_print(input);
+    return 0;
+}
+```

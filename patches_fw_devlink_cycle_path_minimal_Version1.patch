@@ -1,0 +1,123 @@
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 8f5ae30d69d7..ffffffffffff 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -60,6 +60,21 @@
+ #include "base.h"
+ 
++/* Limit for cycle path printing to keep logs sane */
++#define FW_DEVLINK_MAX_CYCLE_DEPTH 256
++
++struct fw_cycle_ctx {
++	int depth;
++	const struct fwnode_handle *stack[FW_DEVLINK_MAX_CYCLE_DEPTH];
++};
++
++static void fw_devlink_print_cycle_path(const struct fwnode_handle *con,
++					const struct fw_cycle_ctx *ctx)
++{
++	pr_info("%pfwf", con);
++	for (int i = 0; i < ctx->depth; i++)
++		pr_cont(" -> %pfwf", ctx->stack[i]);
++	pr_cont(" -> %pfwf\n", con);
++}
++
+ /**
+  * __fwnode_link_del - Delete a link between two fwnode_handles.
+  * @link: the fwnode_link to be deleted
+@@ -1968,11 +1983,13 @@ static struct device *fwnode_get_next_parent_dev(const struct fwnode_handle *fwn
+  * Return true if one or more cycles were found. Otherwise, return false.
+  */
+-static bool __fw_devlink_relax_cycles(struct fwnode_handle *con_handle,
+-				     struct fwnode_handle *sup_handle)
++static bool __fw_devlink_relax_cycles(struct fwnode_handle *con_handle,
++				      struct fwnode_handle *sup_handle,
++				      struct fw_cycle_ctx *ctx)
+ {
+ 	struct device *sup_dev = NULL, *par_dev = NULL, *con_dev = NULL;
+ 	struct fwnode_link *link;
+ 	struct device_link *dev_link;
+ 	bool ret = false;
++	struct fwnode_handle *parent;
+ 
+ 	if (!sup_handle)
+ 		return false;
+@@ -1987,7 +2004,10 @@ static bool __fw_devlink_relax_cycles(struct fwnode_handle *con_handle,
+ 	sup_handle->flags |= FWNODE_FLAG_VISITED;
+ 
+ 	/* Termination condition. */
+ 	if (sup_handle == con_handle) {
+-		pr_debug("----- cycle: start -----\n");
++		pr_debug("----- cycle: start -----\n");
++		/* Print a readable path like A -> B -> C -> A */
++		if (ctx)
++			fw_devlink_print_cycle_path(con_handle, ctx);
+ 		ret = true;
+ 		goto out;
+ 	}
+@@ -2008,9 +2028,17 @@ static bool __fw_devlink_relax_cycles(struct fwnode_handle *con_handle,
+ 	list_for_each_entry(link, &sup_handle->suppliers, c_hook) {
+ 		if (link->flags & FWLINK_FLAG_IGNORE)
+ 			continue;
+ 
+-		if (__fw_devlink_relax_cycles(con_handle, link->supplier)) {
++		/* Push: remember this step in the path */
++		if (ctx && ctx->depth < FW_DEVLINK_MAX_CYCLE_DEPTH)
++			ctx->stack[ctx->depth++] = link->supplier;
++
++		if (__fw_devlink_relax_cycles(con_handle, link->supplier, ctx)) {
+ 			__fwnode_link_cycle(link);
+ 			ret = true;
+ 		}
++
++		/* Pop: backtrack the path */
++		if (ctx && ctx->depth > 0)
++			ctx->depth--;
+ 	}
+ 
+ 	/*
+@@ -2018,8 +2046,26 @@ static bool __fw_devlink_relax_cycles(struct fwnode_handle *con_handle,
+ 	 * parent-child relationships that are modeled using device hierarchy.
+ 	 */
+-	par_dev = get_dev_from_fwnode(fwnode_get_parent(sup_handle));
++	parent = fwnode_get_parent(sup_handle);
++	if (parent) {
++		par_dev = get_dev_from_fwnode(parent);
++
++		/* Push: include the parent step for path printing */
++		if (ctx && ctx->depth < FW_DEVLINK_MAX_CYCLE_DEPTH)
++			ctx->stack[ctx->depth++] = parent;
++
++		if (__fw_devlink_relax_cycles(con_handle, parent, ctx)) {
++			/* No explicit fwnode_link to mark for parent edges */
++			ret = true;
++		}
++
++		/* Pop: backtrack the path */
++		if (ctx && ctx->depth > 0)
++			ctx->depth--;
++
++		fwnode_handle_put(parent);
++	}
+ 
+ out:
+ 	return ret;
+ }
+@@ -2124,12 +2170,19 @@ static int fw_devlink_create_devlink(struct device *con,
+ 	 * detected.
+ 	 */
+ 	device_links_write_lock();
+-	if (__fw_devlink_relax_cycles(link->consumer, sup_handle)) {
++	/* Build a tiny context to print: consumer -> supplier -> ... -> consumer */
++	struct fw_cycle_ctx ctx = { 0 };
++	ctx.depth = 1;
++	ctx.stack[0] = sup_handle;
++
++	if (__fw_devlink_relax_cycles(link->consumer, sup_handle, &ctx)) {
+ 		__fwnode_link_cycle(link);
+-		pr_debug("----- cycle: end -----\n");
++		pr_debug("----- cycle: end -----\n");
+ 		pr_info("%pfwf: Fixed dependency cycle(s) with %pfwf\n",
+ 			link->consumer, sup_handle);
+ 	}
+ 	device_links_write_unlock();

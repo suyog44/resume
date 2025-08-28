@@ -1,0 +1,75 @@
+--- a/init/main.c
++++ b/init/main.c
+@@ -XXX,XX +XXX,XX @@ static void __init do_ctors(void)
+ {
+ #ifdef CONFIG_CONSTRUCTORS
+ 	ctor_fn_t *fn = (ctor_fn_t *) __ctors_start;
++	ctor_fn_t *ctors_end = (ctor_fn_t *) __ctors_end;
++	size_t ctor_count = ctors_end - fn;
++	size_t idx = 0;
+ 
+-	for (; fn < (ctor_fn_t *) __ctors_end; fn++)
+-		(*fn)();
++	pr_info("do_ctors: start=%p, end=%p, count=%zu\n", 
++		__ctors_start, __ctors_end, ctor_count);
++
++	/* Validate constructor section bounds */
++	if (unlikely(fn >= ctors_end)) {
++		pr_err("KASAN DEBUG: do_ctors: Invalid constructor section bounds\n");
++		return;
++	}
++
++	for (; fn < ctors_end; fn++, idx++) {
++		/* Validate each constructor pointer before calling */
++		if (unlikely(!fn || !(*fn))) {
++			pr_err("KASAN DEBUG: do_ctors: NULL constructor at idx=%zu, ptr=%p\n", 
++			       idx, fn);
++			continue;
++		}
++
++		/* Check for out-of-bounds access */
++		if (unlikely(fn >= ctors_end)) {
++			pr_err("KASAN DEBUG: do_ctors: OOB access at idx=%zu, fn=%p, end=%p\n", 
++			       idx, fn, ctors_end);
++			break;
++		}
++
++		pr_debug("do_ctors: calling constructor %zu at %p -> %pS\n", 
++			 idx, fn, *fn);
++		
++		(*fn)();
++	}
++	
++	pr_info("do_ctors: completed %zu constructors\n", idx);
+ #endif
+ }
+
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -XXX,XX +XXX,XX @@ 
+ 
+ int C_A_D = 1;
+ struct pid *cad_pid;
++
++/* Debug function to validate cad_pid access */
++static inline void validate_cad_pid_access(const char *func)
++{
++	pr_debug("KASAN DEBUG: %s: cad_pid=%p, value=%d\n", 
++		 func, &cad_pid, cad_pid ? pid_vnr(cad_pid) : -1);
++		 
++	/* Add bounds check if cad_pid is used as array/pointer */
++	if (unlikely((void *)&cad_pid < (void *)&C_A_D || 
++		     (void *)&cad_pid > (void *)(&cad_pid + 1))) {
++		pr_err("KASAN DEBUG: %s: cad_pid out of expected bounds\n", func);
++	}
++}
+ 
+ #ifdef __sparc__
+ int sysctl_reboot(struct ctl_table *table, int write,
+@@ -XXX,XX +XXX,XX @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+ 	struct pid *pid;
++	validate_cad_pid_access(__func__);
+ 	char buffer[256];
+ 	int ret = 0;

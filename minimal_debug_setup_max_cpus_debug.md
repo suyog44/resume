@@ -342,3 +342,293 @@ If No Crash Occurs (False Positive):
 The kernel will boot successfully with debug output, indicating KASAN might have false positive.
 
 Apply the patch, rebuild your kernel, and share the debug output - this will definitively reveal what's happening with setup_max_cpus!
+
+You're absolutely correct! I made a mistake in the redzone checking approach. We need to check the shadow memory, not the direct redzone bytes. Thank you for the correction!
+
+🔧 Corrected Shadow Memory Calculation
+
+For ARM64 with 39-bit VA, the KASAN shadow offset is indeed:
+
+· Shadow offset = 0xdfffffc000000000
+· Shadow scale = 3 (each shadow byte covers 8 application bytes)
+
+The Correct Formula:
+
+```c
+shadow_address = (application_address >> 3) + KASAN_SHADOW_OFFSET
+```
+
+Where:
+
+· application_address = the memory address we want to check (e.g., setup_max_cpus+0x8)
+· KASAN_SHADOW_OFFSET = 0xdfffffc000000000 for 39-bit VA
+· Each shadow byte represents the accessibility of 8 application bytes
+
+🛠️ Corrected Patch File
+
+Here's the fixed patch with proper shadow memory checking:
+
+```patch
+From: Debug Helper <debug@kernel.org>
+Date: Mon Jan 27 2025
+Subject: [PATCH] Add proper KASAN shadow memory debug for setup_max_cpus
+
+Add correct shadow memory calculation for ARM64 39-bit VA to investigate
+the global-out-of-bounds KASAN error at setup_max_cpus+0x8.
+
+Signed-off-by: Debug Helper <debug@kernel.org>
+---
+
+ init/main.c | 112 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+
+diff --git a/init/main.c b/init/main.c
+index 1234567..89abcde 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -XXX,XX +XXX,XX @@
+ #include <linux/rodata_test.h>
+ #include <linux/jump_label.h>
+ #include <linux/mem_encrypt.h>
++#include <linux/kasan.h>
++#include <linux/types.h>
+ 
+ #include <asm/io.h>
+ #include <asm/sections.h>
+@@ -XXX,XX +XXX,XX @@
+ 
+ #include "do_mounts.h"
+ 
++/* Debug variables for setup_max_cpus investigation */
++static unsigned long setup_max_cpus_addr = 0xffffffc083ca4de0UL;
++static unsigned long kasan_shadow_offset = 0xdfffffc000000000UL;
++static unsigned long setup_max_cpus_access_count = 0;
++
++/* KASAN shadow memory access functions */
++static u8 __init read_shadow_byte(unsigned long addr)
++{
++	unsigned long shadow_addr = (addr >> 3) + kasan_shadow_offset;
++	return *(u8 *)shadow_addr;
++}
++
++static void __init debug_shadow_memory_analysis(void)
++{
++	u8 shadow_byte;
++	
++	pr_emerg("=== KASAN SHADOW MEMORY ANALYSIS ===\n");
++	pr_emerg("KASAN shadow offset: 0x%016lx\n", kasan_shadow_offset);
++	pr_emerg("setup_max_cpus address: 0x%016lx\n", setup_max_cpus_addr);
++	
++	/* Check shadow memory for setup_max_cpus (first 4 bytes) */
++	shadow_byte = read_shadow_byte(setup_max_cpus_addr);
++	pr_emerg("Shadow byte for setup_max_cpus@%px: 0x%02x\n", 
++	         (void *)setup_max_cpus_addr, shadow_byte);
++	
++	/* Interpret the shadow byte */
++	if (shadow_byte == 0x00) {
++		pr_emerg("  -> All 8 bytes are accessible (unlikely for 4-byte variable)\n");
++	} else if (shadow_byte == 0x04) {
++		pr_emerg("  -> First 4 bytes accessible, next 4 bytes are REDZONE (expected)\n");
++	} else if (shadow_byte == 0xFA || shadow_byte == 0xF9) {
++		pr_emerg("  -> All bytes are REDZONE (0x%02x)\n", shadow_byte);
++	} else {
++		pr_emerg("  -> Partial accessibility: %d bytes accessible\n", shadow_byte);
++	}
++	
++	/* Check shadow memory for setup_max_cpus+0x8 (the crash address) */
++	shadow_byte = read_shadow_byte(setup_max_cpus_addr + 0x8);
++	pr_emerg("Shadow byte for setup_max_cpus+0x8@%px: 0x%02x\n", 
++	         (void *)(setup_max_cpus_addr + 0x8), shadow_byte);
++	
++	if (shadow_byte == 0xFA || shadow_byte == 0xF9) {
++		pr_emerg("  -> REDZONE detected (0x%02x) - KASAN should trigger on access\n", shadow_byte);
++	} else if (shadow_byte == 0x00) {
++		pr_emerg("  -> All bytes accessible - KASAN should NOT trigger\n");
++	} else {
++		pr_emerg("  -> Unexpected shadow value: 0x%02x\n", shadow_byte);
++	}
++	
++	/* Check a range around setup_max_cpus to see the memory layout */
++	pr_emerg("Shadow memory around setup_max_cpus:\n");
++	int i;
++	for (i = -16; i <= 16; i += 8) {
++		unsigned long test_addr = setup_max_cpus_addr + i;
++		shadow_byte = read_shadow_byte(test_addr);
++		pr_emerg("  %c%px: 0x%02x%s\n", 
++		         (i == 0) ? '>' : ' ',
++		         (void *)test_addr, shadow_byte,
++		         (i == 0) ? " <-- setup_max_cpus" : 
++		         (i == 8) ? " <-- crash address" : "");
++	}
++}
++
++static void __init debug_memory_layout_analysis(void)
++{
++	pr_emerg("=== MEMORY LAYOUT ANALYSIS ===\n");
++	
++	/* Check if setup_max_cpus is in the correct section */
++	pr_emerg("setup_max_cpus address: %px\n", (void *)setup_max_cpus_addr);
++	
++	/* Calculate the shadow address for manual verification */
++	unsigned long shadow_addr = (setup_max_cpus_addr >> 3) + kasan_shadow_offset;
++	pr_emerg("Calculated shadow address: %px\n", (void *)shadow_addr);
++	
++	/* Test accessibility pattern */
++	pr_emerg("Testing memory access patterns:\n");
++	
++	/* Read the actual variable (should be safe) */
++	unsigned int actual_value = *(unsigned int *)setup_max_cpus_addr;
++	pr_emerg("setup_max_cpus value: %u\n", actual_value);
++	
++	/* Check what's at the crash address */
++	unsigned int *crash_addr = (unsigned int *)(setup_max_cpus_addr + 0x8);
++	pr_emerg("Value at crash address (%px): 0x%08x\n", crash_addr, *crash_addr);
++}
++
++static void __init debug_kasan_validation(void)
++{
++	pr_emerg("=== KASAN VALIDATION TEST ===\n");
++	
++	/* Test 1: Valid access to setup_max_cpus (should work) */
++	pr_emerg("Test 1: Reading setup_max_cpus directly...\n");
++	unsigned int value = *(unsigned int *)setup_max_cpus_addr;
++	pr_emerg("  Value: %u (OK)\n", value);
++	
++	/* Test 2: Try to simulate the crash condition */
++	pr_emerg("Test 2: Checking crash address accessibility...\n");
++	u8 shadow_value = read_shadow_byte(setup_max_cpus_addr + 0x8);
++	
++	if (shadow_value == 0xFA || shadow_value == 0xF9) {
++		pr_emerg("  -> Shadow memory confirms REDZONE at crash address\n");
++		pr_emerg("  -> KASAN detection appears valid\n");
++	} else {
++		pr_emerg("  -> Shadow memory shows 0x%02x - unexpected value\n", shadow_value);
++		pr_emerg("  -> This might indicate a KASAN false positive\n");
++	}
++	
++	/* Test 3: Check if this is an alignment issue */
++	if (setup_max_cpus_addr % 8 != 0) {
++		pr_emerg("*** setup_max_cpus is not 8-byte aligned (alignment: %ld) ***\n", 
++		         setup_max_cpus_addr % 8);
++		pr_emerg("*** This can cause issues with 8-byte accesses on ARM64 ***\n");
++	}
++}
++
++static void __init minimal_shadow_debug(void)
++{
++	u8 shadow_byte;
++	
++	pr_emerg("=== MINIMAL SHADOW MEMORY DEBUG ===\n");
++	
++	/* Check the crash address shadow memory */
++	shadow_byte = read_shadow_byte(setup_max_cpus_addr + 0x8);
++	pr_emerg("Shadow byte for %px (setup_max_cpus+0x8): 0x%02x\n", 
++	         (void *)(setup_max_cpus_addr + 0x8), shadow_byte);
++	
++	if (shadow_byte == 0xFA || shadow_byte == 0xF9) {
++		pr_emerg("*** REDZONE confirmed - KASAN detection is valid ***\n");
++	} else if (shadow_byte == 0x00) {
++		pr_emerg("*** NO REDZONE - KASAN might be false positive ***\n");
++	} else {
++		pr_emerg("*** UNEXPECTED: 0x%02x - needs investigation ***\n", shadow_byte);
++	}
++}
++
+ static void __init do_basic_setup(void)
+ {
++	pr_emerg("=== DO_BASIC_SETUP START ===\n");
++	
++	/* Initial shadow memory state */
++	minimal_shadow_debug();
++	
+ 	cpuset_init_smp();
+ 	driver_init();
+ 	init_irq_proc();
+ 	do_ctors();
+ 	do_initcalls();
++	
++	/* Comprehensive analysis after initcalls */
++	pr_emerg("=== POST-INITCALL ANALYSIS ===\n");
++	debug_shadow_memory_analysis();
++	debug_memory_layout_analysis();
++	debug_kasan_validation();
++	
++	pr_emerg("=== DO_BASIC_SETUP COMPLETE ===\n");
+ }
+ 
+ /* This is the single-threaded CPU startup. */
+```
+
+🔍 What This Corrected Patch Does
+
+1. Proper Shadow Memory Calculation
+
+```c
+static u8 __init read_shadow_byte(unsigned long addr)
+{
+    unsigned long shadow_addr = (addr >> 3) + kasan_shadow_offset;
+    return *(u8 *)shadow_addr;
+}
+```
+
+2. Shadow Byte Interpretation
+
+· 0x00: All 8 bytes accessible
+· 0x04: First 4 bytes accessible (expected for setup_max_cpus)
+· 0xFA/0xF9: Redzone (KASAN should trigger)
+· Other values: Partial accessibility
+
+3. Comprehensive Analysis
+
+· Checks shadow memory for both setup_max_cpus and setup_max_cpus+0x8
+· Validates the KASAN detection logic
+· Tests memory access patterns
+
+🎯 Expected Output Examples
+
+If KASAN Detection is Valid:
+
+```
+Shadow byte for ffffffc083ca4de8 (setup_max_cpus+0x8): 0xFA
+*** REDZONE confirmed - KASAN detection is valid ***
+```
+
+If KASAN False Positive:
+
+```
+Shadow byte for ffffffc083ca4de8 (setup_max_cpus+0x8): 0x00
+*** NO REDZONE - KASAN might be false positive ***
+```
+
+If Memory Corruption:
+
+```
+Shadow byte for ffffffc083ca4de8 (setup_max_cpus+0x8): 0x12
+*** UNEXPECTED: 0x12 - needs investigation ***
+```
+
+📋 How to Apply
+
+```bash
+# Save the patch
+cat > setup_max_cpus_shadow_debug.patch << 'EOF'
+[Paste the corrected patch content above]
+EOF
+
+# Apply and build
+cd /path/to/kernel/source
+git apply setup_max_cpus_shadow_debug.patch
+make -j$(nproc)
+```
+
+🔧 Verification of Your Inputs
+
+Your inputs were 100% correct:
+
+· ✅ 39-bit VA → Shadow offset = 0xdfffffc000000000
+· ✅ Shadow scale = 3 (>> 3 for address conversion)
+· ✅ Each shadow byte covers 8 application bytes
+
+Thank you for the correction! This shadow memory approach will give us the definitive answer about whether this is a real KASAN detection or a false positive.
+
+Apply this corrected patch and the shadow memory analysis will tell us exactly what's happening!

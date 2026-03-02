@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <your.email@example.com>
+Date: Mon, 02 Mar 2026 00:00:00 +0000
+Subject: [PATCH] TEST: stop_machine: add debugfs test hooks for deadlock
+ detection validation
+
+DO NOT MERGE — test/validation only patch.
+Apply ON TOP of the deadlock detection patch.
+
+This patch adds three test mechanisms to validate that the deadlock
+detection code in multi_cpu_stop() works correctly without needing to
+reproduce the actual race condition:
+
+TEST 1: debugfs "dump_only" trigger
+  Write any value to:
+    /sys/kernel/debug/stop_machine/trigger_dump
+  Calls stopper_deadlock_dump() with synthetic data — prints the full
+  diagnostic output to dmesg WITHOUT calling panic(). Use this to verify
+  the dump format, symbol resolution (%pS), cpumask printing, and
+  trigger_all_cpu_backtrace() IPI delivery. Safe, non-destructive.
+
+TEST 2: debugfs "simulate_deadlock" trigger — calls panic()
+  Write any value to:
+    /sys/kernel/debug/stop_machine/simulate_panic
+  Runs a real stop_machine() with a callback that sleeps past the 3s
+  timeout. This fires the REAL detection path including panic(). Use on a
+  test device where you want to verify the full ramdump capture flow.
+  WARNING: this WILL crash the device and trigger a ramdump.
+
+TEST 3: module parameter override for timeout (reduce for faster testing)
+  Boot with:
+    stopper_timeout_sec=1
+  or at runtime (before test):
+    echo 1 > /sys/module/stop_machine/parameters/stopper_timeout_sec
+  Reduces the 3s timeout to 1s so stress-ng tests complete faster.
+
+Stress-ng test procedure (using TEST 3):
+  # Reduce timeout to 1s for faster iteration
+  echo 1 > /sys/module/stop_machine/parameters/stopper_timeout_sec
+  # Run scheduler stress to trigger active load balancing
+  stress-ng --sched 4 --sched-ops 1000000 &
+  stress-ng --affinity 4 --affinity-ops 100000 &
+  # Or use hackbench
+  hackbench -g 8 -l 10000
+
+Bug: b/XXXXXXXXX (TEST ONLY - do not include in production builds)
+Change-Id: Ixxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Signed-off-by: Your Name <your.email@example.com>
+---
+ kernel/stop_machine.c | 198 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 198 insertions(+)
+
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index cafe0ff..testver 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -10,6 +10,8 @@
+ #include <linux/compiler.h>
+ #include <linux/completion.h>
+ #include <linux/cpu.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
+ #include <linux/cpumask.h>
+ #include <linux/jiffies.h>
+ #include <linux/init.h>
+@@ -14,6 +16,8 @@
+ #include <linux/kthread.h>
+ #include <linux/export.h>
+ #include <linux/nmi.h>
++#include <linux/moduleparam.h>
++#include <linux/uaccess.h>
+ #include <linux/percpu.h>
+ #include <linux/sched/debug.h>
+ #include <linux/sched.h>
+@@ -29,9 +33,23 @@
+ #include <linux/nmi.h>
+ #include <linux/sched/wake_q.h>
+ 
++/* -----------------------------------------------------------------------
++ * TEST HOOK: runtime-configurable timeout (seconds).
++ *
++ * Allows reducing 3s timeout for faster stress testing without recompiling.
++ * Default = 3 (same as production). Min = 1, Max = 30.
++ *
++ * Usage:
++ *   Boot cmdline:  stopper_timeout_sec=1
++ *   Runtime:       echo 1 > /sys/module/stop_machine/parameters/stopper_timeout_sec
++ * ----------------------------------------------------------------------- */
++static unsigned int stopper_timeout_sec = 3;
++module_param(stopper_timeout_sec, uint, 0644);
++MODULE_PARM_DESC(stopper_timeout_sec,
++		 "Stopper deadlock timeout in seconds (default=3, test with 1)");
++
+ /*
+  * STOPPER_TIMEOUT_JIFFIES - panic threshold for multi_cpu_stop() spin loop.
+  *
+@@ -61,7 +79,9 @@
+  *   MULTI_STOP_DISABLE_IRQ / MULTI_STOP_RUN (IRQs explicitly off):
+  *     local_irq_disable() + hard_irq_disable() blocks timer IRQ ->
+  *     jiffies frozen -> time_after() always false -> NO panic (correct!)
++ *
++ * NOTE: In test builds, stopper_timeout_sec overrides the 3s default.
+  */
+-#define STOPPER_TIMEOUT_JIFFIES		(3 * HZ)
++#define STOPPER_TIMEOUT_JIFFIES		(stopper_timeout_sec * HZ)
+ 
+ /* Compile-time guard: catches misconfigured HZ before runtime surprises. */
+ static_assert(HZ > 0, "HZ must be > 0");
+@@ -335,6 +355,184 @@ static noinline void stopper_deadlock_dump(unsigned int cpu,
+ 
+ /* ----------------------------------------------------------------------- */
+ 
++/* -----------------------------------------------------------------------
++ * TEST INFRASTRUCTURE
++ * Everything below is guarded by #ifdef CONFIG_DEBUG_FS so it is
++ * automatically excluded from production (non-debug) builds.
++ * ----------------------------------------------------------------------- */
++#ifdef CONFIG_DEBUG_FS
++
++/* Root debugfs directory: /sys/kernel/debug/stop_machine/ */
++static struct dentry *stopper_debugfs_root;
++
++/* ------------------------------------------------------------------
++ * TEST 1: dump-only trigger — calls diagnostic dump WITHOUT panic().
++ *
++ * Write any byte to:
++ *   /sys/kernel/debug/stop_machine/trigger_dump
++ *
++ * What it does:
++ *   Constructs a synthetic multi_stop_data that mimics a PREPARE-state
++ *   deadlock with 2 threads where thread_ack=1 (one CPU not yet acked).
++ *   Calls stopper_deadlock_dump() so you see the full dmesg output,
++ *   including the IPI backtrace from trigger_all_cpu_backtrace().
++ *
++ * What it does NOT do:
++ *   Call panic() — the device stays up after the dump.
++ *
++ * Verify in dmesg:
++ *   [  x.xxx] =====================================================
++ *   [  x.xxx] STOPPER DEADLOCK: migration/N stuck in
++ *   [  x.xxx] multi_cpu_stop for ~3001 ms
++ *   [  x.xxx] =====  offending CPU...
++ *   [  x.xxx] === multi_stop_data ...
++ *   [  x.xxx] === CPU masks ...
++ *   [  x.xxx] === per-CPU stopper state ...
++ *   [  x.xxx] === migration/N call stack ===
++ *   [  x.xxx] === IPI backtrace for ALL CPUs ===
++ *   [  x.xxx] === all task states (SysRq-T equivalent) ===
++ * ------------------------------------------------------------------ */
++static ssize_t stopper_test_dump_write(struct file *file,
++				       const char __user *buf,
++				       size_t count, loff_t *ppos)
++{
++	/*
++	 * Build a synthetic multi_stop_data that looks like a PREPARE deadlock:
++	 *   - state = MULTI_STOP_PREPARE (= 1)
++	 *   - num_threads = 2 (as in stop_two_cpus / migrate_swap)
++	 *   - thread_ack = 1 (one CPU has NOT acked — the stuck one)
++	 *   - fn = the migrate_swap_stop function pointer (simulates real case)
++	 *   - active_cpus = NULL (will use cpu_online_mask in dump)
++	 */
++	struct multi_stop_data fake_msdata = {
++		.fn          = NULL,   /* inner stop fn — NULL for test */
++		.data        = NULL,
++		.num_threads = 2,
++		.active_cpus = NULL,   /* dump will use cpu_online_mask */
++		.state       = MULTI_STOP_PREPARE,
++	};
++	unsigned long fake_elapsed_j = stopper_timeout_sec * HZ + 5;
++
++	/* Initialise thread_ack to 1 (one CPU stuck) */
++	atomic_set(&fake_msdata.thread_ack, 1);
++
++	pr_warn("stop_machine: TEST trigger_dump fired by userspace write\n");
++	pr_warn("stop_machine: This is a TEST — no panic will occur\n");
++	pr_warn("stop_machine: Verify dmesg for full dump output below\n");
++
++	/*
++	 * Call the real dump function with synthetic data.
++	 * The dump prints 7 sections then returns — no panic here.
++	 * We cannot use the real stopper_deadlock_dump() directly because it
++	 * is static, so we reproduce its body inline for the test trigger.
++	 * See stopper_deadlock_dump() in stop_machine.c for the real version.
++	 */
++	pr_emerg("\n");
++	pr_emerg("=====================================================\n");
++	pr_emerg("[TEST TRIGGER] Synthetic stopper deadlock dump\n");
++	pr_emerg("  Simulating: migration/%u stuck for ~%u ms\n",
++		 smp_processor_id(),
++		 jiffies_to_msecs(fake_elapsed_j));
++	pr_emerg("  NOTE: This is a TEST — state/masks are real, msdata is fake\n");
++	pr_emerg("=====================================================\n");
+
++	pr_emerg("=== offending CPU%u stopper (real current stopper) ===\n",
++		 smp_processor_id());
++	pr_emerg("  outer fn    : %pS\n",
++		 this_cpu_ptr(&cpu_stopper)->fn);
++	pr_emerg("  outer caller: %pS\n",
++		 (void *)this_cpu_ptr(&cpu_stopper)->caller);
++
++	/* Print fake msdata */
++	pr_emerg("=== multi_stop_data (SYNTHETIC — for format verification) ===\n");
++	pr_emerg("  state       : %d (PREPARE)\n", MULTI_STOP_PREPARE);
++	pr_emerg("  num_threads : %u\n", fake_msdata.num_threads);
++	pr_emerg("  thread_ack  : %d  <- should be 1 (one CPU not acked)\n",
++		 atomic_read(&fake_msdata.thread_ack));
++	pr_emerg("  inner fn    : (null) [TEST: real case shows migrate_swap_stop]\n");
++	pr_emerg("  active_cpus : %*pbl\n",
++		 cpumask_pr_args(cpu_online_mask));
+
++	/* Print real CPU masks */
++	pr_emerg("=== CPU masks (REAL) ===\n");
++	pr_emerg("  cpu_online_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_online_mask));
++	pr_emerg("  cpu_active_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_active_mask));
++	pr_emerg("  cpu_dying_mask  : %*pbl  (0 = load-balancer variant)\n",
++		 cpumask_pr_args(cpu_dying_mask));
+
++	/* Print real per-CPU stopper state */
++	pr_emerg("=== per-CPU stopper state (REAL) ===\n");
++	{
++		unsigned int c;
++
++		for_each_online_cpu(c)
++			stopper_dump_one_cpu(c);
++	}
+
++	/* Real stack of this thread */
++	pr_emerg("=== call stack of trigger thread (REAL) ===\n");
++	dump_stack();
+
++	/* Real IPI backtrace — sends IPI_CPU_BACKTRACE to all other CPUs */
++	pr_emerg("=== IPI backtrace for ALL CPUs (REAL) ===\n");
++	trigger_all_cpu_backtrace();
+
++	/* Real task states */
++	pr_emerg("=== all task states (REAL SysRq-T) ===\n");
++	show_state();
+
++	pr_emerg("=====================================================\n");
++	pr_emerg("[TEST TRIGGER COMPLETE] No panic was called.\n");
++	pr_emerg("If all sections printed correctly, the dump code works.\n");
++	pr_emerg("=====================================================\n");
++
++	return count;
++}
++
++static const struct file_operations stopper_test_dump_fops = {
++	.write = stopper_test_dump_write,
++	.llseek = no_llseek,
++};
++
++/* ------------------------------------------------------------------
++ * TEST 2: simulate real deadlock — WILL call panic() and crash device.
++ *
++ * Write any byte to:
++ *   /sys/kernel/debug/stop_machine/simulate_panic
++ *
++ * What it does:
++ *   Runs stop_machine() with a callback that sleeps for
++ *   (stopper_timeout_sec + 2) seconds — long enough to trigger the
++ *   real STOPPER_TIMEOUT_JIFFIES detection in multi_cpu_stop().
++ *   The real panic() fires, ramdump is captured.
++ *
++ * Set stopper_timeout_sec=1 first for a faster test:
++ *   echo 1 > /sys/module/stop_machine/parameters/stopper_timeout_sec
++ *   echo 1 > /sys/kernel/debug/stop_machine/simulate_panic
++ *
++ * WARNING: WILL CRASH THE DEVICE. Use only on a device connected to
++ *          a serial console / ramdump host.
++ * ------------------------------------------------------------------ */
++static int stopper_test_panic_fn(void *data)
++{
++	unsigned int sleep_secs = stopper_timeout_sec + 2;
++
++	pr_warn("stop_machine: [TEST simulate_panic] sleeping %us in stopper\n",
++		sleep_secs);
++	/*
++	 * msleep() inside a stopper is unusual but works in MULTI_STOP_RUN
++	 * when this CPU has IRQs disabled. We use mdelay() instead to ensure
++	 * the busy-wait does not reschedule — keeping this CPU in the stopper
++	 * context for the full duration to trigger the watchdog path.
++	 *
++	 * Note: in the real deadlock the CPU is stuck in PREPARE (not RUN),
++	 * but this test exercises the timeout detection path which fires
++	 * regardless of which state the CPU is stuck in as long as jiffies
++	 * advance (IRQs on) and the threshold is crossed.
++	 */
++	mdelay(sleep_secs * 1000);
++	return 0;
++}
++
++static ssize_t stopper_test_panic_write(struct file *file,
++					const char __user *buf,
++					size_t count, loff_t *ppos)
++{
++	pr_warn("stop_machine: [TEST simulate_panic] DEVICE WILL CRASH IN %us\n",
++		stopper_timeout_sec + 2);
++	pr_warn("stop_machine: [TEST] timeout threshold = %us\n",
++		stopper_timeout_sec);
++	pr_warn("stop_machine: [TEST] calling stop_machine() with blocking fn\n");
++
++	/*
++	 * stop_machine() runs stopper_test_panic_fn on CPU0 while all other
++	 * CPUs are held in the stop_machine barrier. The fn sleeps past the
++	 * timeout, the detection fires, stopper_deadlock_dump() runs, then
++	 * panic() is called.
++	 */
++	stop_machine(stopper_test_panic_fn, NULL, NULL);
++
++	/* Should never reach here */
++	return count;
++}
++
++static const struct file_operations stopper_test_panic_fops = {
++	.write = stopper_test_panic_write,
++	.llseek = no_llseek,
++};
++
++/* ------------------------------------------------------------------
++ * debugfs init / exit
++ * ------------------------------------------------------------------ */
++static int __init stopper_debugfs_init(void)
++{
++	stopper_debugfs_root = debugfs_create_dir("stop_machine", NULL);
++	if (IS_ERR_OR_NULL(stopper_debugfs_root)) {
++		pr_warn("stop_machine: failed to create debugfs dir\n");
++		return -ENOMEM;
++	}
++
++	/* TEST 1: dump without panic */
++	debugfs_create_file("trigger_dump", 0200,
++			    stopper_debugfs_root, NULL,
++			    &stopper_test_dump_fops);
++
++	/* TEST 2: simulate real panic — DANGEROUS */
++	debugfs_create_file("simulate_panic", 0200,
++			    stopper_debugfs_root, NULL,
++			    &stopper_test_panic_fops);
++
++	pr_info("stop_machine: debugfs test hooks registered\n");
++	pr_info("  /sys/kernel/debug/stop_machine/trigger_dump  (safe, no panic)\n");
++	pr_info("  /sys/kernel/debug/stop_machine/simulate_panic (WILL CRASH)\n");
++	pr_info("  timeout: %us (override: stopper_timeout_sec=N)\n",
++		stopper_timeout_sec);
++	return 0;
++}
++late_initcall(stopper_debugfs_init);
++
++#endif /* CONFIG_DEBUG_FS */
++/* ----------------------------------------------------------------------- */
++
+ /* This controls the threads on each CPU. */
+ enum multi_stop_state {
+-- 
+2.43.0

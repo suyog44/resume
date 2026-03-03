@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <your.email@example.com>
+Date: Tue, 03 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ANDROID: stop_machine: panic with full CPU dump if migration
+ thread stuck > 3s in multi_cpu_stop
+
+Problem
+-------
+On Qualcomm platforms running Android16/GKI (Linux 6.12, Clang 19,
+CONFIG_HZ=250, CONFIG_NO_HZ_IDLE=y), migration/N threads deadlock inside
+multi_cpu_stop() when active_load_balance_cpu_stop() triggers a nested
+stop_one_cpu_nowait() via:
+
+  finish_task_switch()
+    -> run_balance_callbacks()
+      -> sched_balance_rq()  OR  balance_push()
+        -> stop_one_cpu_nowait()    <-- re-entrancy while already executing
+                                        inside stop_two_cpus / multi_cpu_stop
+
+The outer stop_machine cannot release the stopper until it exits.  The
+nested stop work cannot be processed until the stopper is free.  The active
+CPU is stuck queuing the nested work with IRQs ON, in PREPARE state.
+Non-active CPUs spin at position C of the do-while loop (see below).  The
+Qualcomm msm_watchdog fires a bark ~10-11 s later; by then crash context
+(call stacks, stopper state, task list) is partially lost.
+
+"No of cores hotplugged: 0" confirms the load-balancer nested stop variant,
+NOT the hotplug variant.
+
+This patch detects the deadlock after 3 seconds, emits a full per-CPU
+diagnostic dump, and calls panic() -- capturing a clean ramdump well before
+the Qualcomm watchdog fires.
+
+==========================================================================
+Fix 1: int cpu -> unsigned int cpu
+==========================================================================
+smp_processor_id() returns 'unsigned int'.  The original 'int cpu' is a
+pre-existing type mismatch against cpumask_test_cpu(unsigned int, ...) and
+per_cpu_ptr(..., unsigned int).  Clang 19 warns on every call site via
+-Wsigned-unsigned-enum-conversion.  'err' retains int because msdata->fn()
+can return negative error codes.
+
+==========================================================================
+Fix 2: Unconditional jiffies-based deadlock detection at position C
+==========================================================================
+The multi_cpu_stop() spin loop has three positions:
+
+  do {
+      if (curstate < msdata->state) { curstate = ...; switch ... }
+
+      if (is_active)
+          ack_state(msdata);                /* A: active CPU only */
+      else if (curstate > MULTI_STOP_PREPARE) {
+          touch_nmi_watchdog();
+          rcu_momentary_eqs();              /* B: non-active, past PREPARE */
+      }
+      /* C: ALL CPUs every iteration -- not reached from B in PREPARE */
+
+  } while (curstate != MULTI_STOP_EXIT);
+
+In the PREPARE-state deadlock (IRQs ON on all CPUs):
+  - Active CPU:      stuck queuing nested stop -> never acks -> stays at A
+  - Non-active CPUs: curstate == PREPARE so "curstate > PREPARE" is FALSE
+                     -> position B NOT entered -> they spin at position C
+
+Placing the timeout check inside position B (else-if) is WRONG:
+  1. Unreachable when curstate == PREPARE (the actual deadlock state)
+  2. Even when reached (DISABLE_IRQ/RUN): local_irq_disable() +
+     hard_irq_disable() called -> jiffies frozen -> time_after() always
+     false -> detection never fires
+
+The CORRECT placement is position C -- unconditional, after both branches.
+jiffies naturally freeze in IRQ-off states, suppressing false positives:
+
+  PREPARE (IRQs ON -- deadlock state):
+    HZ=250 (from /proc/config.gz): tick every 4ms -> jiffies++ ->
+    after 3*250=750 jiffies (3000ms) -> time_after() true -> panic()
+
+  DISABLE_IRQ / RUN (IRQs OFF):
+    local_irq_disable() + hard_irq_disable() -> timer IRQ blocked ->
+    jiffies frozen -> time_after() always false -> NO panic (correct!)
+
+CONFIG_NO_HZ_IDLE=y (from /proc/config.gz on target):
+  tick_nohz_idle_enter() is called ONLY from cpu_idle_loop().
+  migration/N threads are SCHED_FIFO RT and never call cpu_idle_loop().
+  -> Ticks fire at full HZ=250 during the PREPARE deadlock.
+
+CONFIG_NO_HZ_FULL=n -- not set. No concern.
+
+CONFIG_HZ=250 (from /proc/config.gz):
+  STOPPER_TIMEOUT_JIFFIES = 3 * 250 = 750 jiffies = 3000 ms
+  Qualcomm bark_time              = ~9000-11000 ms
+  Safety margin before bark       = ~6000 ms -- panic always wins ramdump
+
+==========================================================================
+Diagnostics emitted before panic()
+==========================================================================
+  Sec 1: outer stopper fn + caller on detecting CPU (root cause -- the
+         cpu_stop_work that called stop_two_cpus() causing re-entrancy)
+  Sec 2: multi_stop_data: state name, num_threads, thread_ack, inner fn
+  Sec 3: cpu_online/active/dying masks
+          (cpu_dying_mask==0 confirms load-balancer variant vs hotplug)
+  Sec 4: per-CPU stopper state for ALL online CPUs (lockless snapshot)
+  Sec 5: dump_stack() for the stuck migration/N thread
+  Sec 6: trigger_all_cpu_backtrace() -- IPI_CPU_BACKTRACE to all CPUs
+          (same IPI path as Qualcomm msm_watchdog ping_other_cpus)
+  Sec 7: show_state() -- SysRq-T equivalent
+
+==========================================================================
+Build fixes vs previous revisions
+==========================================================================
+  [FIX-A] dump helpers placed AFTER struct multi_stop_data.
+    Inserting after enum multi_stop_state (line 167) but before
+    struct multi_stop_data (~line 180) caused Clang 19 to treat
+    'struct multi_stop_data' in function parameters as a new forward
+    declaration, triggering [-Werror,-Wvisibility].
+
+  [FIX-C] Deadlock detection at position C (unconditional), not inside
+    the else-if block (position B).  The else-if closing brace must be
+    a CONTEXT line, not an added line.
+
+==========================================================================
+Android GKI compliance
+==========================================================================
+  - Single file: kernel/stop_machine.c only
+  - No new exported symbols, no new Kconfig options
+  - Clang 19 / LLD 19 compatible
+  - trigger_all_cpu_backtrace(): <linux/nmi.h> already in stop_machine.c
+  - show_state(): <linux/sched/debug.h> -- always present in GKI
+  - jiffies / HZ / time_after(): unconditionally available
+
+Bug: b/XXXXXXXXX
+Change-Id: Ixxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Signed-off-by: Your Name <your.email@example.com>
+---
+ kernel/stop_machine.c | 257 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 249 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 5d2d056..prodfix1 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -10,9 +10,12 @@
+ #include <linux/compiler.h>
+ #include <linux/completion.h>
+ #include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/jiffies.h>
+ #include <linux/init.h>
+ #include <linux/kthread.h>
+ #include <linux/export.h>
+ #include <linux/percpu.h>
++#include <linux/sched/debug.h>
+ #include <linux/sched.h>
+ #include <linux/stop_machine.h>
+ #include <linux/interrupt.h>
+@@ -25,6 +28,26 @@
+ #include <linux/nmi.h>
+ #include <linux/sched/wake_q.h>
+ 
++/*
++ * STOPPER_TIMEOUT_JIFFIES -- jiffies-based panic threshold.
++ *
++ * CONFIG_HZ=250 (confirmed /proc/config.gz on target): 1 jiffy = 4ms.
++ * 3 * 250 = 750 jiffies = 3000ms.  Qualcomm bark_time ~9-11s.
++ * Safety margin ~6000ms -- panic always wins the ramdump capture race.
++ *
++ * jiffies freeze when IRQs are disabled (DISABLE_IRQ/RUN states) so the
++ * timeout auto-suppresses in those states without any explicit state check.
++ *
++ * CONFIG_NO_HZ_IDLE=y (target): safe because migration/N threads are
++ * SCHED_FIFO RT and never call cpu_idle_loop() -- ticks fire at full rate.
++ * CONFIG_NO_HZ_FULL=n -- not set on target. No concern.
++ */
++#define STOPPER_TIMEOUT_JIFFIES		(3 * HZ)
++
++/* Compile-time guard: catches misconfigured HZ before runtime. */
++static_assert(HZ > 0, "HZ must be > 0");
++
+ /*
+  * Structure to determine completion condition and record errors. May
+  * be shared by works on different cpus.
+@@ -195,6 +218,184 @@ struct multi_stop_data {
+ 	atomic_t thread_ack;
+ };
+ 
++/*
++ * stopper_state_names[] -- human-readable names for enum multi_stop_state.
++ *
++ * [FIX-A] Placed here, after BOTH enum multi_stop_state AND
++ * struct multi_stop_data, so that:
++ *   - The designated-initialiser constants [MULTI_STOP_x] are in scope.
++ *   - The dump helpers below can reference 'struct multi_stop_data *' in
++ *     function parameters without triggering Clang 19's [-Wvisibility].
++ */
++static const char * const stopper_state_names[] = {
++	[MULTI_STOP_NONE]        = "NONE",
++	[MULTI_STOP_PREPARE]     = "PREPARE",
++	[MULTI_STOP_DISABLE_IRQ] = "DISABLE_IRQ",
++	[MULTI_STOP_RUN]         = "RUN",
++	[MULTI_STOP_EXIT]        = "EXIT",
++};
++static_assert(ARRAY_SIZE(stopper_state_names) == MULTI_STOP_EXIT + 1,
++	      "stopper_state_names[] out of sync with enum multi_stop_state");
++
++/* -----------------------------------------------------------------------
++ * Stopper deadlock diagnostic helpers.
++ * All noinline -- only called from the panic path.
++ * ----------------------------------------------------------------------- */
++
++/**
++ * stopper_dump_one_cpu() - print per-cpu stopper state to dmesg
++ * @cpu: target CPU (unsigned int -- matches smp_processor_id() return type)
++ *
++ * Lockless read of cpu_stopper -- intentional on the panic path.
++ * Best-effort snapshot preferred over missing the dump entirely.
++ */
++static noinline void stopper_dump_one_cpu(unsigned int cpu)
++{
++	struct cpu_stopper *st = per_cpu_ptr(&cpu_stopper, cpu);
++	struct cpu_stop_work *w;
++	int n = 0;
++
++	pr_emerg("  [CPU%u stopper] task=%-16s enabled=%d\n",
++		 cpu,
++		 st->thread ? st->thread->comm : "(null)",
++		 st->enabled);
++	pr_emerg("                 fn=%pS  caller=%pS\n",
++		 st->fn, (void *)st->caller);
++
++	/* Walk pending work list -- lockless, best-effort. */
++	list_for_each_entry(w, &st->works, list) {
++		pr_emerg("    pending[%d]: fn=%pS  caller=%pS\n",
++			 n++, w->fn, (void *)w->caller);
++		if (n >= 8) {
++			pr_emerg("    ... (truncated at 8 entries)\n");
++			break;
++		}
++	}
++	if (!n)
++		pr_emerg("    pending works: (none)\n");
++}
++
++/**
++ * stopper_dump_msdata() - print multi_stop_data fields to dmesg
++ * @msdata:    shared state machine data for this stop operation
++ * @stuck_cpu: CPU that detected the timeout
++ */
++static noinline void stopper_dump_msdata(struct multi_stop_data *msdata,
++					 unsigned int stuck_cpu)
++{
++	int state = READ_ONCE(msdata->state);
++	const char *sname;
++
++	sname = ((unsigned int)state < ARRAY_SIZE(stopper_state_names) &&
++		 stopper_state_names[state])
++		? stopper_state_names[state] : "UNKNOWN";
++
++	pr_emerg("=== multi_stop_data (CPU%u) ===\n", stuck_cpu);
++	pr_emerg("  state       : %d (%s)\n", state, sname);
++	pr_emerg("  num_threads : %u\n", msdata->num_threads);
++	pr_emerg("  thread_ack  : %d  <- CPUs NOT yet acked\n",
++		 atomic_read(&msdata->thread_ack));
++	pr_emerg("  inner fn    : %pS\n", msdata->fn);
++	pr_emerg("  active_cpus : %*pbl\n",
++		 cpumask_pr_args(msdata->active_cpus
++				 ? msdata->active_cpus : cpu_online_mask));
++}
++
++/**
++ * stopper_deadlock_dump() - emit 7-section diagnostic dump before panic()
++ * @cpu:       detecting CPU id (unsigned int)
++ * @msdata:    shared multi_stop_data for this stop operation
++ * @elapsed_j: jiffies elapsed since spin entry (display only)
++ *
++ * noinline so migration/N appears clearly at the top of the call stack.
++ * Returns to caller which must call panic().
++ */
++static noinline void stopper_deadlock_dump(unsigned int cpu,
++					   struct multi_stop_data *msdata,
++					   unsigned long elapsed_j)
++{
++	struct cpu_stopper *st = this_cpu_ptr(&cpu_stopper);
++	unsigned int c;
++
++	pr_emerg("\n");
++	pr_emerg("=====================================================\n");
++	pr_emerg("STOPPER DEADLOCK: migration/%u stuck in\n"
++		 "multi_cpu_stop for ~%u ms\n"
++		 "Suspected cause: nested cpu_stop_queue_work() re-entrancy\n"
++		 "  e.g. active_load_balance_cpu_stop()\n"
++		 "       -> finish_task_switch() -> run_balance_callbacks()\n"
++		 "       -> sched_balance_rq() -> stop_one_cpu_nowait()\n"
++		 "  while already executing inside stop_two_cpus().\n",
++		 cpu, jiffies_to_msecs(elapsed_j));
++	pr_emerg("=====================================================\n");
++
++	/*
++	 * Section 1: OUTER stopper -- the cpu_stop_work that called
++	 * stop_two_cpus() and caused the nested re-entrancy deadlock.
++	 */
++	pr_emerg("=== offending CPU%u outer stopper ===\n", cpu);
++	pr_emerg("  outer fn    : %pS\n", st->fn);
++	pr_emerg("  outer caller: %pS\n", (void *)st->caller);
++
++	/* Section 2: state machine position and ack count */
++	stopper_dump_msdata(msdata, cpu);
++
++	/*
++	 * Section 3: CPU masks.
++	 *   cpu_dying_mask == 0 -> load-balancer nested stop (our case)
++	 *   cpu_dying_mask != 0 -> hotplug-triggered variant
++	 */
++	pr_emerg("=== CPU masks ===\n");
++	pr_emerg("  cpu_online_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_online_mask));
++	pr_emerg("  cpu_active_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_active_mask));
++	pr_emerg("  cpu_dying_mask  : %*pbl  (non-zero = hotplug variant)\n",
++		 cpumask_pr_args(cpu_dying_mask));
++
++	/* Section 4: per-CPU stopper state for every online CPU */
++	pr_emerg("=== per-CPU stopper state (all online CPUs) ===\n");
++	for_each_online_cpu(c)
++		stopper_dump_one_cpu(c);
++
++	/* Section 5: call stack of the stuck migration/N thread */
++	pr_emerg("=== migration/%u call stack ===\n", cpu);
++	dump_stack();
++
++	/* Section 6: IPI backtrace -- same mechanism as Qualcomm watchdog
++	 * ping_other_cpus().  trigger_all_cpu_backtrace() uses
++	 * IPI_CPU_BACKTRACE; declared in <linux/nmi.h> (already included).
++	 */
++	pr_emerg("=== IPI backtrace for ALL CPUs ===\n");
++	trigger_all_cpu_backtrace();
++
++	/* Section 7: all task states -- SysRq-T equivalent. */
++	pr_emerg("=== all task states (SysRq-T equivalent) ===\n");
++	show_state();
++
++	pr_emerg("=====================================================\n");
++	pr_emerg("Calling panic() to trigger ramdump/minidump.\n"
++		 "bark_time (~9-11s) > 3s threshold => ramdump wins.\n");
++	pr_emerg("=====================================================\n");
++}
++
++/* ----------------------------------------------------------------------- */
++
+ static int multi_cpu_stop(void *data)
+ {
+ 	struct multi_stop_data *msdata = data;
+@@ -209,8 +410,12 @@ static int multi_cpu_stop(void *data)
+ 	struct multi_stop_data *msdata = data;
+ 	enum multi_stop_state newstate, curstate = MULTI_STOP_NONE;
+-	int cpu = smp_processor_id(), err = 0;
++	/*
++	 * FIX: smp_processor_id() returns unsigned int.  'int cpu' is a
++	 * pre-existing mismatch vs cpumask_test_cpu(unsigned int, ...) and
++	 * per_cpu_ptr(..., unsigned int).  Clang 19 warns at every call site.
++	 * 'err' stays int: msdata->fn() can return negative error codes.
++	 */
++	unsigned int cpu = smp_processor_id();
++	int err = 0, timed_out = 0;
+ 	const struct cpumask *cpumask;
+ 	unsigned long flags;
++	unsigned long start_jiffies;
+ 	bool is_active;
+ 
+@@ -232,6 +437,12 @@ static int multi_cpu_stop(void *data)
+ 		is_active = cpumask_test_cpu(cpu, cpumask);
+ 	}
+ 
++	/*
++	 * Snapshot jiffies before entering the spin loop.
++	 * jiffies advances via the timer tick interrupt -- the same subsystem
++	 * as the Qualcomm msm_watchdog pet_timer kthread.
++	 * See STOPPER_TIMEOUT_JIFFIES comment above for full rationale.
++	 */
++	start_jiffies = jiffies;
++
+ 	/* Simple state machine */
+ 	do {
+ 		/* Chill out and ensure we re-read multi_stop_state. */
+@@ -250,9 +461,47 @@ static int multi_cpu_stop(void *data)
+ 		} else if (curstate > MULTI_STOP_PREPARE) {
+ 			/*
+ 			 * At this stage all other CPUs we depend on must spin
+-			 * in the same loop. Any reason for hard-lockup should
+-			 * be detected and reported on their side.
++			 * in the same loop.  Touch the NMI watchdog and suppress
++			 * RCU stall warnings while we spin.
+ 			 */
+ 			touch_nmi_watchdog();
+-			/* Also suppress RCU CPU stall warnings. */
+ 			rcu_momentary_eqs();
+ 		}
++
++		/*
++		 * [FIX-C] Deadlock detection -- position C, unconditional.
++		 *
++		 * Placed AFTER the closing '}' of the else-if block so it runs
++		 * for ALL CPUs in ALL states, including PREPARE (deadlock state):
++		 *
++		 *   PREPARE (IRQs ON):
++		 *     Active CPU:     stuck queuing nested stop -> no ack -> A
++		 *     Non-active CPUs: curstate==PREPARE -> B not entered -> C
++		 *     HZ=250: jiffies tick every 4ms -> after
++		 *     3*HZ (3*250=750 = 3000ms) ->
++		 *     time_after() true -> panic()
++		 *
++		 *   DISABLE_IRQ / RUN (IRQs OFF):
++		 *     local_irq_disable() + hard_irq_disable() block timer IRQ
++		 *     -> jiffies freeze -> time_after() always false -> no panic
++		 *
++		 * WRONG placement: inside "else if (curstate > PREPARE)" (B):
++		 *   1. Unreachable when curstate == PREPARE (actual deadlock).
++		 *   2. When reached (DISABLE_IRQ/RUN): IRQs OFF, jiffies frozen
++		 *      -> time_after() never true -> detection never fires.
++		 *
++		 * CONFIG_NO_HZ_IDLE=y: safe because migration/N threads are
++		 * SCHED_FIFO RT and never call cpu_idle_loop() -> ticks fire
++		 * at full HZ=250 in PREPARE state.
++		 *
++		 * timed_out prevents re-entering dump/panic before panic() wins.
++		 */
++		if (!timed_out &&
++		    time_after(jiffies,
++			       start_jiffies + STOPPER_TIMEOUT_JIFFIES)) {
++			unsigned long elapsed_j = jiffies - start_jiffies;
++
++			timed_out = 1;
++			stopper_deadlock_dump(cpu, msdata, elapsed_j);
++			panic("migration/%u: stuck in multi_cpu_stop "
++			      "for ~%u ms | state=%s thread_ack=%d "
++			      "stop_fn=%pS | nested stop_machine "
++			      "deadlock | see ramdump for full trace\n",
++			      cpu,
++			      jiffies_to_msecs(elapsed_j),
++			      stopper_state_names[
++				min_t(unsigned int,
++				      (unsigned int)READ_ONCE(msdata->state),
++				      MULTI_STOP_EXIT)],
++			      atomic_read(&msdata->thread_ack),
++			      this_cpu_ptr(&cpu_stopper)->fn);
++		}
++
+ 	} while (curstate != MULTI_STOP_EXIT);
+ 
+-- 
+2.43.0

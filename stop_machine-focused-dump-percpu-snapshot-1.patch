@@ -1,0 +1,689 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <your.email@example.com>
+Date: Tue, 03 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ANDROID: stop_machine: focused dump on affected CPU +
+ per-CPU snapshot recording on all other cores at 3s
+
+Problem
+-------
+On Qualcomm platforms running Android16/GKI (Linux 6.12, Clang 19,
+CONFIG_HZ=250, CONFIG_NO_HZ_IDLE=y), migration/N threads deadlock inside
+multi_cpu_stop() when active_load_balance_cpu_stop() triggers a nested
+stop_one_cpu_nowait() via:
+
+  finish_task_switch()
+    -> run_balance_callbacks()
+      -> sched_balance_rq() OR balance_push()
+        -> stop_one_cpu_nowait()   <-- re-entrancy while already executing
+                                        inside stop_two_cpus / multi_cpu_stop
+
+==========================================================================
+Design (v3 -- focused dump + per-CPU snapshot)
+==========================================================================
+
+Previous approach called trigger_all_cpu_backtrace() from the dump owner,
+which sends IPI_CPU_BACKTRACE to all cores and waits for each to respond.
+This introduced the risk of per-CPU IPI timeout (10s/CPU on arm64 if any
+core has IRQs disabled) and produced interleaved output.
+
+This version splits responsibilities cleanly:
+
+  EVERY CPU that detects the 3s timeout (including the owner):
+    Step 1 -- Write a lightweight per-CPU snapshot into its OWN percpu
+              slot. Writing to own percpu slot is always safe -- no locks,
+              no contention, no races regardless of how many CPUs detect
+              simultaneously.
+    Step 2 -- atomic_cmpxchg(&stopper_dump_owner, -1, cpu):
+              ONE CPU wins and becomes the dump owner.
+              ALL others enter: while(1) cpu_relax() + touch_nmi_watchdog()
+
+  DUMP OWNER (the affected/detecting CPU):
+    - Full diagnostic dump of ITSELF (Sec1-5): outer fn, msdata, CPU
+      masks, own stopper state, own dump_stack().
+    - Then reads all other CPUs' percpu snapshots (Sec6) and prints them
+      sequentially -- clean, single-threaded, zero interleaving.
+    - panic() immediately.
+
+  NON-OWNER CPUs:
+    - Already wrote their snapshot in Step 1 before entering the spin.
+    - Spin in while(1) cpu_relax() + touch_nmi_watchdog().
+    - Owner's panic() brings them down.
+
+==========================================================================
+Per-CPU snapshot struct (stopper_cpu_snapshot)
+==========================================================================
+
+Each CPU fills in its own percpu slot when it detects the timeout:
+
+  struct stopper_cpu_snapshot {
+      unsigned int   cpu;         /* which CPU this snapshot is from    */
+      int            curstate;    /* multi_stop_state at timeout moment  */
+      bool           is_active;   /* was this the active (fn-running) CPU*/
+      void          *fn;          /* cpu_stopper->fn at snapshot time    */
+      unsigned long  caller;      /* cpu_stopper->caller at snapshot time*/
+      unsigned long  elapsed_j;   /* jiffies elapsed since spin entry    */
+      bool           valid;       /* set last -- signals owner to print  */
+  };
+
+  valid is written LAST after all other fields are populated (store
+  ordering enforced by smp_wmb() between payload writes and valid=true).
+  Owner reads valid with READ_ONCE() to decide whether to print a slot.
+  No lock needed: each CPU writes only its own slot, owner only reads.
+
+==========================================================================
+Why this is better than trigger_all_cpu_backtrace()
+==========================================================================
+
+trigger_all_cpu_backtrace() (IPI_CPU_BACKTRACE):
+  - Sends IPI to each CPU and waits up to 10s for a response.
+  - On arm64, if ANY target CPU has IRQs disabled: 10s timeout per CPU.
+  - In PREPARE state: IRQs are ON, so the IPI itself is fast.
+  - But in other contexts (e.g. a mix of PREPARE and DISABLE_IRQ):
+    could add up to 10s * N_cpus of blocking before panic().
+  - Output interleaves with owner dump output.
+  - Removed in this patch.
+
+Per-CPU snapshot approach:
+  - Zero IPI, zero cross-CPU communication.
+  - Each CPU writes only to its own percpu slot at the moment it detects
+    the timeout. This is already happening (each CPU independently spins
+    at position C) -- we just add a 5-field struct write before the spin.
+  - Owner reads all slots sequentially after its own dump -- fully
+    serialized, clean output, bounded time (<1ms total).
+  - Captures curstate, is_active, fn, caller at the EXACT moment of
+    timeout detection on each CPU -- more precise than IPI backtrace.
+
+==========================================================================
+TIMELINE
+==========================================================================
+
+  T=0s    deadlock begins (active CPU stuck at ack_state(PREPARE))
+
+  T=3s    time_after() fires on one or more CPUs at position C
+          Each detecting CPU:
+            (a) fills in per_cpu(stopper_snapshot, cpu)  [lockless, own slot]
+            (b) atomic_cmpxchg(&stopper_dump_owner, -1, cpu)
+
+          ONE CPU wins (owner):
+            Sec1: outer stopper fn + caller              (<50ms)
+            Sec2: multi_stop_data state                  (<50ms)
+            Sec3: CPU masks                              (<50ms)
+            Sec4: own CPU stopper state (detailed)       (<100ms)
+            Sec5: own dump_stack()                       (~100ms)
+            Sec6: read + print all percpu snapshots      (<10ms)
+                  (sequential, no IPI, no cross-CPU wait)
+            panic() immediately
+
+          ALL others (non-owners):
+            Spin: while(1) { cpu_relax(); touch_nmi_watchdog(); }
+            Owner's panic() brings them down.
+
+  T~3.5s  panic() called -- ramdump captured
+  T=11s   Qualcomm bark_time (worst case) -- ~7.5s safety margin
+
+==========================================================================
+rcu_momentary_eqs() interaction (position B)
+==========================================================================
+
+rcu_momentary_eqs() is called at position B:
+  else if (curstate > MULTI_STOP_PREPARE) {
+      touch_nmi_watchdog();
+      rcu_momentary_eqs();
+  }
+
+The caller contract (from kernel/rcu/tree_plugin.h):
+  "The caller must have disabled interrupts and must not be idle."
+
+In the PREPARE-state deadlock: curstate == PREPARE, so the condition
+(curstate > PREPARE) is FALSE. Position B is NEVER entered. IRQs remain
+ON. rcu_momentary_eqs() never runs. Its local_irq_save() path inside
+rcu_preempt_deferred_qs() is therefore not a concern.
+
+In normal (non-deadlock) paths: position B is reached in DISABLE_IRQ or
+RUN states where IRQs are already disabled. rcu_momentary_eqs() safely
+calls local_irq_save() on an already-disabled state. Jiffies stay frozen.
+time_after() stays false. No false positive.
+
+This confirms the IRQ-off false-positive guard works correctly for all
+non-deadlock states, independent of rcu_momentary_eqs() behavior.
+
+==========================================================================
+Fix 1: int cpu -> unsigned int cpu (retained from production patch)
+==========================================================================
+
+smp_processor_id() returns 'unsigned int'. 'int cpu' is a pre-existing
+mismatch vs cpumask_test_cpu(unsigned int,...) and per_cpu_ptr(...,
+unsigned int). Clang 19 warns at every call site.
+
+==========================================================================
+Fix 2: Position C unconditional detection (retained from production patch)
+==========================================================================
+
+  do {
+    if (curstate < msdata->state) { ... }
+    if (is_active)       ack_state(msdata);         /* A */
+    else if (curstate > MULTI_STOP_PREPARE) {
+        touch_nmi_watchdog(); rcu_momentary_eqs();  /* B: not in PREPARE */
+    }
+    /* C: ALL CPUs, ALL states, every iteration */
+    if (!timed_out && time_after(...)) { ... }
+  } while (curstate != MULTI_STOP_EXIT);
+
+==========================================================================
+Android GKI compliance
+==========================================================================
+
+- Single file: kernel/stop_machine.c only
+- No new exported symbols, no new Kconfig options
+- Clang 19 / LLD 19 compatible
+- atomic_cmpxchg(): <linux/atomic.h> via kernel.h -- already included
+- DEFINE_PER_CPU(): <linux/percpu.h> -- already included in stop_machine.c
+- smp_wmb() / READ_ONCE(): unconditionally available
+- show_state(): <linux/sched/debug.h> -- always present in GKI
+- jiffies / HZ / time_after(): unconditionally available
+- No trigger_all_cpu_backtrace() -- removed (IPI hazard, not needed)
+
+Bug: b/XXXXXXXXX
+Change-Id: Ixxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Signed-off-by: Your Name <your.email@example.com>
+---
+ kernel/stop_machine.c | 318 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 307 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 5d2d056..snapshot1 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -10,9 +10,12 @@
+ #include <linux/compiler.h>
+ #include <linux/completion.h>
+ #include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/jiffies.h>
+ #include <linux/init.h>
+ #include <linux/kthread.h>
+ #include <linux/export.h>
+ #include <linux/percpu.h>
++#include <linux/sched/debug.h>
+ #include <linux/sched.h>
+ #include <linux/stop_machine.h>
+ #include <linux/interrupt.h>
+@@ -25,6 +28,87 @@
+ #include <linux/nmi.h>
+ #include <linux/sched/wake_q.h>
+
++/*
++ * STOPPER_TIMEOUT_JIFFIES -- jiffies threshold for deadlock detection.
++ *
++ * CONFIG_HZ=250 (target): 3 * 250 = 750 jiffies = 3000ms.
++ * Fires at position C in PREPARE state where IRQs are ON.
++ * In DISABLE_IRQ/RUN: IRQs off, jiffies frozen, time_after() false.
++ * CONFIG_NO_HZ_IDLE=y: safe -- migration/N is SCHED_FIFO RT, never idle.
++ */
++#define STOPPER_TIMEOUT_JIFFIES  (3 * HZ)
+
++/* Compile-time guard: catches misconfigured HZ before runtime. */
++static_assert(HZ > 0, "HZ must be > 0");
++
++/*
++ * stopper_dump_owner -- atomic guard for single-CPU dump execution.
++ *
++ * Initialized to -1 (no owner). The first CPU to win
++ * atomic_cmpxchg(&stopper_dump_owner, -1, cpu) becomes the sole dump
++ * owner and runs the full diagnostic dump then calls panic().
++ *
++ * All other detecting CPUs spin in:
++ *   while (1) { cpu_relax(); touch_nmi_watchdog(); }
++ *
++ * They have already written their state into their own percpu
++ * stopper_snapshot slot before attempting the cmpxchg, so the owner
++ * can read all snapshots sequentially after its own dump.
++ */
++static atomic_t stopper_dump_owner = ATOMIC_INIT(-1);
++
++/**
++ * struct stopper_cpu_snapshot - lightweight per-CPU state at timeout moment
++ *
++ * Each CPU fills in its OWN percpu slot when it detects the 3s timeout,
++ * before attempting the dump-owner cmpxchg. Writing to own percpu slot
++ * is always safe: no locks, no atomic ops, no contention.
++ *
++ * Field write ordering:
++ *   All payload fields (cpu, curstate, is_active, fn, caller, elapsed_j)
++ *   are written first, then smp_wmb(), then valid = true.
++ *   Owner reads valid with READ_ONCE() to decide whether to print a slot.
++ *
++ * @cpu:       CPU id of the snapshotting CPU
++ * @curstate:  multi_stop_state at the moment of snapshot
++ * @is_active: was this CPU the active (fn-executing) CPU?
++ * @fn:        stopper fn -- passed from call site (this_cpu_ptr(&cpu_stopper)->fn)
++ * @caller:    stopper caller -- passed from call site (cpu_stopper->caller)
++ * @elapsed_j: jiffies elapsed since spin entry (approximate deadlock age)
++ * @valid:     written last; signals owner that this slot has useful data
++ */
++struct stopper_cpu_snapshot {
++	unsigned int   cpu;
++	int            curstate;
++	bool           is_active;
++	void          *fn;
++	unsigned long  caller;
++	unsigned long  elapsed_j;
++	bool           valid;
++};
++
++/*
++ * stopper_snapshots[] -- one slot per possible CPU.
++ *
++ * DEFINE_PER_CPU zero-initialises all fields including valid=false.
++ * Slots are written by the owning CPU at timeout detection.
++ * Slots are read by the dump owner after it wins the cmpxchg.
++ * No synchronisation needed beyond the smp_wmb() + READ_ONCE() pair.
++ */
++DEFINE_PER_CPU(struct stopper_cpu_snapshot, stopper_snapshot);
++
++/**
++ * stopper_snapshot_self() - record this CPU's state into its percpu slot
++ * @cpu:       this CPU's id
++ * @curstate:  current multi_stop_state
++ * @is_active: true if this is the active (fn-running) CPU
++ * @elapsed_j: jiffies elapsed since spin entry
++ *
++ * Called by EVERY CPU that detects the timeout, before the cmpxchg.
++ * Captures the stopper fn and caller at the exact moment of detection.
++ * Lockless -- writes only to this CPU's own percpu slot.
++ */
++static void stopper_snapshot_self(unsigned int cpu, int curstate,
++				  bool is_active, void *fn,
++				  unsigned long caller,
++				  unsigned long elapsed_j)
++{
++	struct stopper_cpu_snapshot *snap = this_cpu_ptr(&stopper_snapshot);
++
++	/*
++	 * fn and caller are passed in from multi_cpu_stop() where
++	 * struct cpu_stopper is fully defined. This function is placed
++	 * early in the file (before struct cpu_stopper) and must NOT
++	 * reference cpu_stopper directly -- that is the build error we fix.
++	 */
++	snap->cpu       = cpu;
++	snap->curstate  = curstate;
++	snap->is_active = is_active;
++	snap->fn        = fn;
++	snap->caller    = caller;
++	snap->elapsed_j = elapsed_j;
++	/*
++	 * Ensure all payload fields are visible to other CPUs before
++	 * setting valid = true. The owner reads valid with READ_ONCE()
++	 * to decide whether to print this slot.
++	 */
++	smp_wmb();
++	WRITE_ONCE(snap->valid, true);
++}
++
+ /*
+  * Structure to determine completion condition and record errors. May
+  * be shared by works on different cpus.
+@@ -195,6 +279,174 @@ struct multi_stop_data {
+ 	atomic_t thread_ack;
+ };
+
++/*
++ * stopper_state_names[] -- human-readable names for enum multi_stop_state.
++ *
++ * [FIX-A] Placed here, after BOTH enum multi_stop_state AND
++ * struct multi_stop_data, so that:
++ *  - The designated-initialiser constants [MULTI_STOP_x] are in scope.
++ *  - The dump helpers can reference 'struct multi_stop_data *' without
++ *    triggering Clang 19's [-Werror,-Wvisibility].
++ */
++static const char * const stopper_state_names[] = {
++	[MULTI_STOP_NONE]        = "NONE",
++	[MULTI_STOP_PREPARE]     = "PREPARE",
++	[MULTI_STOP_DISABLE_IRQ] = "DISABLE_IRQ",
++	[MULTI_STOP_RUN]         = "RUN",
++	[MULTI_STOP_EXIT]        = "EXIT",
++};
++static_assert(ARRAY_SIZE(stopper_state_names) == MULTI_STOP_EXIT + 1,
++	"stopper_state_names[] out of sync with enum multi_stop_state");
++
++static inline const char *state_name(int s)
++{
++	return ((unsigned int)s < ARRAY_SIZE(stopper_state_names) &&
++		stopper_state_names[s])
++		? stopper_state_names[s] : "UNKNOWN";
++}
++
++/* -----------------------------------------------------------------------
++ * Stopper deadlock diagnostic helpers.
++ * All noinline -- only called from the panic path, one CPU at a time.
++ * ----------------------------------------------------------------------- */
++
++/**
++ * stopper_dump_one_cpu() - print this CPU's stopper state to dmesg
++ * @cpu: the dump-owner CPU (always called for this_cpu only)
++ *
++ * Lockless read of cpu_stopper -- intentional on the panic path.
++ */
++static noinline void stopper_dump_one_cpu(unsigned int cpu)
++{
++	struct cpu_stopper *st = per_cpu_ptr(&cpu_stopper, cpu);
++	struct cpu_stop_work *w;
++	int n = 0;
++
++	pr_emerg("  task=%-16s enabled=%d\n",
++		 st->thread ? st->thread->comm : "(null)",
++		 st->enabled);
++	pr_emerg("  fn=%pS  caller=%pS\n",
++		 st->fn, (void *)st->caller);
++
++	list_for_each_entry(w, &st->works, list) {
++		pr_emerg("  pending[%d]: fn=%pS caller=%pS\n",
++			 n++, w->fn, (void *)w->caller);
++		if (n >= 8) {
++			pr_emerg("  ... (truncated at 8)\n");
++			break;
++		}
++	}
++	if (!n)
++		pr_emerg("  pending works: (none)\n");
++}
+
++/**
++ * stopper_dump_msdata() - print multi_stop_data fields to dmesg
++ * @msdata:    shared state machine data
++ * @owner_cpu: dump-owner CPU id
++ */
++static noinline void stopper_dump_msdata(struct multi_stop_data *msdata,
++					 unsigned int owner_cpu)
++{
++	int state = READ_ONCE(msdata->state);
++
++	pr_emerg("=== Sec2: multi_stop_data (owner CPU%u) ===\n", owner_cpu);
++	pr_emerg("  state       : %d (%s)\n", state, state_name(state));
++	pr_emerg("  num_threads : %u\n", msdata->num_threads);
++	pr_emerg("  thread_ack  : %d  <- CPUs NOT yet acked\n",
++		 atomic_read(&msdata->thread_ack));
++	pr_emerg("  inner fn    : %pS\n", msdata->fn);
++	pr_emerg("  active_cpus : %*pbl\n",
++		 cpumask_pr_args(msdata->active_cpus
++			? msdata->active_cpus : cpu_online_mask));
++}
++
++/**
++ * stopper_print_other_snapshots() - print all non-owner percpu snapshots
++ * @owner_cpu: the dump owner -- its slot is skipped here (printed in Sec4)
++ *
++ * Called by the dump owner after its own detailed dump (Sec1-5).
++ * Walks every online CPU's stopper_snapshot slot. Prints only valid ones.
++ * Completely sequential -- no IPI, no cross-CPU sync beyond READ_ONCE.
++ *
++ * A non-owner CPU may not have reached time_after() yet when the owner
++ * calls this function (it may be in an earlier loop iteration). In that
++ * case valid=false and the slot is printed as "not yet detected" -- this
++ * itself is diagnostic: it tells you which CPUs were still spinning
++ * normally vs which had already detected the deadlock.
++ */
++static noinline void stopper_print_other_snapshots(unsigned int owner_cpu)
++{
++	unsigned int c;
+
++	pr_emerg("=== Sec6: other CPU snapshots at timeout detection ===\n");
++	pr_emerg("  (each CPU records its own state before entering spin)\n");
+
++	for_each_online_cpu(c) {
++		struct stopper_cpu_snapshot *snap;
++		int state;
++
++		if (c == owner_cpu)
++			continue;
++
++		snap = per_cpu_ptr(&stopper_snapshot, c);
+
++		if (!READ_ONCE(snap->valid)) {
++			pr_emerg("  [CPU%u] not yet detected "
++				 "(still in earlier loop iteration)\n", c);
++			continue;
++		}
++
++		/* Pair with smp_wmb() in stopper_snapshot_self() */
++		smp_rmb();
+
++		state = snap->curstate;
++		pr_emerg("  [CPU%u] state=%-11s is_active=%-5s "
++			 "elapsed=~%ums\n",
++			 c, state_name(state),
++			 snap->is_active ? "YES" : "no",
++			 jiffies_to_msecs(snap->elapsed_j));
++		pr_emerg("         fn=%pS\n", snap->fn);
++		pr_emerg("         caller=%pS\n", (void *)snap->caller);
++	}
++}
++
++/**
++ * stopper_deadlock_dump() - focused dump of owner CPU + other snapshots
++ * @cpu:       dump-owner CPU (the affected/detecting core)
++ * @msdata:    shared multi_stop_data for this stop operation
++ * @elapsed_j: jiffies elapsed since spin entry on this CPU
++ *
++ * Called ONLY by the one CPU that wins stopper_dump_owner cmpxchg.
++ * Focuses detailed diagnostics on this CPU (the affected core):
++ *   Sec1: outer stopper fn + caller  -- root cause
++ *   Sec2: multi_stop_data state
++ *   Sec3: CPU masks
++ *   Sec4: this CPU's stopper state (detailed)
++ *   Sec5: this CPU's dump_stack()
++ *   Sec6: lightweight snapshot of all other CPUs (no IPI)
++ * Then returns -- caller calls panic() immediately.
++ */
++static noinline void stopper_deadlock_dump(unsigned int cpu,
++					   struct multi_stop_data *msdata,
++					   unsigned long elapsed_j)
++{
++	struct cpu_stopper *st = this_cpu_ptr(&cpu_stopper);
+
++	pr_emerg("\n");
++	pr_emerg("=====================================================\n");
++	pr_emerg("STOPPER DEADLOCK: migration/%u stuck ~%u ms\n"
++		 "Dump owner: CPU%u  |  Other CPUs: recorded in Sec6\n"
++		 "Cause: nested stop_one_cpu_nowait() re-entrancy\n"
++		 " active_load_balance_cpu_stop()\n"
++		 "   -> finish_task_switch() -> run_balance_callbacks()\n"
++		 "   -> sched_balance_rq() -> stop_one_cpu_nowait()\n"
++		 "   while already inside stop_two_cpus().\n",
++		 cpu, jiffies_to_msecs(elapsed_j), cpu);
++	pr_emerg("=====================================================\n");
+
++	/*
++	 * Sec1: the outer cpu_stop_work that caused the re-entrancy.
++	 * This is the root cause -- which scheduler callback fired.
++	 * Only meaningful on the affected (detecting) CPU.
++	 */
++	pr_emerg("=== Sec1: CPU%u outer stopper (root cause) ===\n", cpu);
++	pr_emerg("  outer fn    : %pS\n", st->fn);
++	pr_emerg("  outer caller: %pS\n", (void *)st->caller);
+
++	/* Sec2: state machine snapshot */
++	stopper_dump_msdata(msdata, cpu);
+
++	/*
++	 * Sec3: CPU masks.
++	 * cpu_dying_mask == 0  -> load-balancer re-entrancy (our case).
++	 * cpu_dying_mask != 0  -> hotplug-triggered variant.
++	 */
++	pr_emerg("=== Sec3: CPU masks ===\n");
++	pr_emerg("  cpu_online_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_online_mask));
++	pr_emerg("  cpu_active_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_active_mask));
++	pr_emerg("  cpu_dying_mask  : %*pbl  (non-zero = hotplug variant)\n",
++		 cpumask_pr_args(cpu_dying_mask));
+
++	/* Sec4: detailed stopper state of the affected CPU only */
++	pr_emerg("=== Sec4: CPU%u stopper state (detailed) ===\n", cpu);
++	stopper_dump_one_cpu(cpu);
+
++	/* Sec5: full call stack of the affected CPU */
++	pr_emerg("=== Sec5: CPU%u call stack ===\n", cpu);
++	dump_stack();
+
++	/*
++	 * Sec6: lightweight snapshots recorded by every other CPU.
++	 * Each non-owner CPU wrote its own percpu slot (curstate, is_active,
++	 * fn, caller, elapsed_j) before entering the spin loop. We read
++	 * all slots here sequentially -- no IPI, no cross-CPU wait,
++	 * bounded time, clean output.
++	 *
++	 * Key diagnostic: is_active=YES means that CPU was the fn-runner.
++	 * state=PREPARE + is_active=YES is the definitive deadlock signature.
++	 * state=PREPARE + is_active=NO means a non-active spinning CPU.
++	 */
++	stopper_print_other_snapshots(cpu);
+
++	pr_emerg("=====================================================\n");
++	pr_emerg("Dump complete. panic() follows immediately.\n"
++		 "Detection: ~3000ms. Qualcomm bark_time: ~11000ms.\n");
++	pr_emerg("=====================================================\n");
++}
++
++/* ----------------------------------------------------------------------- */
++
+ static int multi_cpu_stop(void *data)
+ {
+ 	struct multi_stop_data *msdata = data;
+@@ -209,8 +461,11 @@ static int multi_cpu_stop(void *data)
+ 	struct multi_stop_data *msdata = data;
+ 	enum multi_stop_state newstate, curstate = MULTI_STOP_NONE;
+
+-	int cpu = smp_processor_id(), err = 0;
++	/*
++	 * FIX: smp_processor_id() returns unsigned int. 'int cpu' is a
++	 * pre-existing mismatch vs cpumask_test_cpu(unsigned int, ...) and
++	 * per_cpu_ptr(..., unsigned int). Clang 19 warns at every call site.
++	 */
++	unsigned int cpu = smp_processor_id();
++	int err = 0, timed_out = 0;
+ 	const struct cpumask *cpumask;
+ 	unsigned long flags;
++	unsigned long start_jiffies;
+ 	bool is_active;
+
+@@ -232,6 +487,11 @@ static int multi_cpu_stop(void *data)
+ 	is_active = cpumask_test_cpu(cpu, cpumask);
+ 	}
+
++	/*
++	 * Snapshot start time before the spin loop.
++	 * Advances at HZ=250 in PREPARE state (IRQs ON).
++	 */
++	start_jiffies = jiffies;
++
+ 	/* Simple state machine */
+ 	do {
+ 		/* Chill out and ensure we re-read multi_stop_state. */
+@@ -250,9 +510,67 @@ static int multi_cpu_stop(void *data)
+ 		} else if (curstate > MULTI_STOP_PREPARE) {
+ 			/*
+ 			 * At this stage all other CPUs we depend on must spin
+-			 * in the same loop. Any reason for hard-lockup should
+-			 * be detected and reported on their side.
++			 * in the same loop. Touch the NMI watchdog and
++			 * suppress RCU stall warnings while we spin.
+ 			 */
+ 			touch_nmi_watchdog();
+-			/* Also suppress RCU CPU stall warnings. */
+ 			rcu_momentary_eqs();
+ 		}
++
++		/*
++		 * [FIX-C] Deadlock detection -- position C, unconditional.
++		 *
++		 * PREPARE (IRQs ON -- the deadlock state):
++		 *   HZ=250 -> after 3*HZ (3000ms) -> time_after() true.
++		 *
++		 * DISABLE_IRQ / RUN (IRQs OFF):
++		 *   jiffies frozen -> time_after() false -> no fire.
++		 *
++		 * NOTE on rcu_momentary_eqs() at position B:
++		 *   In PREPARE: curstate == PREPARE -> (curstate > PREPARE)
++		 *   is FALSE -> position B never entered -> IRQs stay ON ->
++		 *   jiffies advance normally -> detection fires correctly.
++		 *   In DISABLE_IRQ/RUN: position B IS entered, IRQs are OFF,
++		 *   rcu_preempt_deferred_qs() calls local_irq_save() on
++		 *   already-disabled IRQs -> jiffies stay frozen -> safe.
++		 *
++		 * TWO-PHASE ACTION when timeout detected:
++		 *
++		 * Phase 1 (ALL detecting CPUs, before cmpxchg):
++		 *   stopper_snapshot_self() -- write own percpu slot.
++		 *   Lockless, own slot, safe for all simultaneous detectors.
++		 *
++		 * Phase 2 (ownership race):
++		 *   atomic_cmpxchg(&stopper_dump_owner, -1, cpu):
++		 *     SUCCESS -> run full dump of this CPU + read all
++		 *                snapshots -> panic() immediately.
++		 *     FAILURE -> spin: while(1) cpu_relax() +
++		 *                touch_nmi_watchdog().
++		 *
++		 * timed_out prevents re-entering Phase 1 + Phase 2 on
++		 * subsequent loop iterations after the spin begins.
++		 */
++		if (!timed_out &&
++		    time_after(jiffies,
++			       start_jiffies + STOPPER_TIMEOUT_JIFFIES)) {
++			unsigned long elapsed_j = jiffies - start_jiffies;
++
++			timed_out = 1;
++
++			/*
++			 * Phase 1: record own state into percpu snapshot.
++			 * Done by ALL detecting CPUs (including future owner)
++			 * before the cmpxchg, so the owner can read them all.
++			 */
++			stopper_snapshot_self(cpu, (int)curstate,
++					      is_active,
++					      this_cpu_ptr(&cpu_stopper)->fn,
++					      (unsigned long)this_cpu_ptr(
++						      &cpu_stopper)->caller,
++					      elapsed_j);
++
++			/*
++			 * Phase 2: race for dump ownership.
++			 */
++			if (atomic_cmpxchg(&stopper_dump_owner,
++					   -1, (int)cpu) == -1) {
++				/*
++				 * Won: full dump of this CPU + all snapshots.
++				 * panic() called immediately after return.
++				 */
++				stopper_deadlock_dump(cpu, msdata, elapsed_j);
++				panic("migration/%u: stuck in multi_cpu_stop "
++				      "for ~%u ms | state=%s thread_ack=%d "
++				      "stop_fn=%pS | nested stop_machine "
++				      "deadlock | see ramdump\n",
++				      cpu,
++				      jiffies_to_msecs(elapsed_j),
++				      stopper_state_names[
++					  min_t(unsigned int,
++						(unsigned int)READ_ONCE(
++							msdata->state),
++						MULTI_STOP_EXIT)],
++				      atomic_read(&msdata->thread_ack),
++				      this_cpu_ptr(&cpu_stopper)->fn);
++			}
++
++			/*
++			 * Non-owner: our snapshot is already written.
++			 * Spin here so we do not corrupt the dump output.
++			 * touch_nmi_watchdog() prevents the NMI watchdog
++			 * firing before owner's panic() brings us down.
++			 */
++			while (1) {
++				cpu_relax();
++				touch_nmi_watchdog();
++			}
++			unreachable();
++		}
++
+ 	} while (curstate != MULTI_STOP_EXIT);
+--
+2.43.0

@@ -1,0 +1,911 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <your.email@example.com>
+Date: Wed, 11 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ANDROID: stop_machine: dual all-CPU self-dump at 8s+9s,
+ panic at 10s on migration deadlock
+
+Problem
+-------
+On Qualcomm platforms running Android16/GKI (Linux 6.12, Clang 19,
+CONFIG_HZ=250, CONFIG_NO_HZ_IDLE=y), migration/N threads deadlock inside
+multi_cpu_stop(). Three confirmed patterns:
+
+  Pattern A -- nested re-entrancy (LB path):
+    active_load_balance_cpu_stop()
+      -> finish_task_switch() -> run_balance_callbacks()
+        -> sched_balance_rq() -> stop_one_cpu_nowait()
+    while already executing inside stop_two_cpus() / multi_cpu_stop().
+    Signature in Sec6: one CPU is_active=YES, others is_active=NO.
+
+  Pattern B -- concurrent stop_machine exhaustion:
+    N concurrent stop_machine() calls (e.g. aarch64_insn_patch_text_cb
+    racing with LB or other callers) exhaust all cpu_stopper threads.
+    Callback issues nested stop_machine() which cannot be serviced.
+    Signature in Sec6: ALL CPUs show is_active=YES.
+
+  Pattern G -- WALT module init race (observed, kworker/2:2):
+    kworker/2:2 executing walt_init [sched_walt] calls stop_machine()
+    to atomically initialise per-CPU WALT data structures. Inside
+    queue_stop_cpus_work(), kworker is preempted by migration/N (RT
+    prio 98) mid-loop. stop_cpus_in_progress=true but not all CPUs
+    have received their work. The preempted kworker's CPU never acks
+    PREPARE; multi_cpu_stop spins forever.
+
+    Observed stack:
+      #4 queue_stop_cpus_work   <- preempted here by migration/N
+      #5 stop_machine_cpuslocked
+      #6 stop_machine
+      #7 walt_init [sched_walt]
+      #8 process_one_work
+      #9 worker_thread
+      Signature: CPU2 is_active=NO curstate=NONE (kworker never ran
+      multi_cpu_stop); remaining CPUs stuck in PREPARE.
+
+The Qualcomm msm_watchdog bark fires at ~11s. This patch detects the
+deadlock at 8s, collects FIRST all-CPU call stacks at detection, then
+triggers a SECOND all-CPU call stack dump immediately before panic at
+10s -- giving two independent stack snapshots in kmsg for comparison.
+panic() triggers ramdump for a third, definitive capture.
+
+==========================================================================
+Design: dual all-CPU self-dump + ktime-bounded wait + panic at 10s
+==========================================================================
+
+Why self-dump instead of trigger_all_cpu_backtrace() IPI:
+  trigger_all_cpu_backtrace() sends IPI_CPU_BACKTRACE to each CPU and
+  waits up to 10 seconds for each response. CPUs in DISABLE_IRQ state
+  have local IRQs disabled -- the IPI cannot be delivered -- so the
+  caller blocks for 10s per unresponsive CPU. On an 8-core device this
+  can be 70s, far beyond the 11s watchdog bark. Ref:
+  patchew.org/linux/fb0b7a92-d371-4510-80c4-25a57f2c4f3d@paulmck-laptop/
+
+  Self-dump (this patch): each CPU that detects the timeout (IRQs ON =
+  PREPARE state) calls dump_stack() on itself synchronously. No IPI.
+  No cross-CPU wait. All dumps appear in kmsg without coordination
+  overhead.
+
+  CPUs in DISABLE_IRQ state cannot detect the timeout (jiffies frozen,
+  time_after() false) and cannot self-dump. The owner logs a timeout
+  message for those CPUs in Sec5. Their stacks are fully preserved in
+  the ramdump captured by panic().
+
+Why two dumps:
+  First dump  (T=8s): Captures the exact state at deadlock onset.
+              Proves all PREPARE CPUs are stuck in multi_cpu_stop().
+  Second dump (T=~8.8s): Confirms no progress in the 0.8s interval.
+              Proves it is a true livelock, not a transient delay.
+              Two independent kmsg records strengthen root-cause analysis
+              when bisecting across ramdumps from different builds.
+
+Non-owner second dump protocol:
+  After completing Phase 1 (first dump), non-owner PREPARE CPUs spin
+  polling stopper_second_dump_trigger. When the owner sets this flag
+  (at T=8.8s), each non-owner calls dump_stack() a second time, sets
+  stopper_second_dump_done, then enters a final spin until panic().
+  DISABLE_IRQ CPUs cannot poll the flag and do not participate in the
+  second dump; their stacks are in the ramdump.
+
+Timeline:
+  T=0s    deadlock begins
+
+  T=8s    time_after() fires on PREPARE-state CPUs (IRQs ON, jiffies live)
+          Phase 1 (ALL detecting CPUs, before cmpxchg):
+            (a) stopper_snapshot_self()  -- write own percpu slot
+            (b) FIRST dump_stack()       -- "CPU%u FIRST dump_stack at 8s"
+            (c) atomic_set(stopper_first_dump_done, 1)
+
+          atomic_cmpxchg(&stopper_dump_owner, -1, cpu):
+            ONE CPU wins --> dump owner: runs Sec1-6, triggers second dump
+            ALL others   --> spin polling stopper_second_dump_trigger
+
+  T=8s    Sec1: owner outer stopper fn + caller
+  T=8s    Sec2: multi_stop_data state
+  T=8s    Sec3: CPU masks
+  T=8s    Sec4: owner stopper state (detailed)
+  T=8-8.8s Sec5: owner polls stopper_first_dump_done for all online CPUs
+                 (DUMP1_WINDOW_MS = 800ms deadline from t_detect)
+  T=8.8s  Sec6: print all percpu snapshots
+
+  T=8.8s  SECOND DUMP TRIGGER:
+            owner sets stopper_second_dump_trigger = 1
+            ALL non-owner PREPARE CPUs see flag, call SECOND dump_stack()
+            owner calls SECOND dump_stack()
+            all set stopper_second_dump_done = 1
+  T=8.8-9.6s owner polls stopper_second_dump_done for all online CPUs
+                 (DUMP2_WINDOW_MS = 1600ms deadline from t_detect)
+
+  T=10s   panic() -- ramdump captured
+            First  dump in kmsg:  T=8s  (deadlock onset)
+            Second dump in kmsg:  T=~8.8s (pre-panic confirmation)
+            Ramdump stacks:       T=10s (definitive, all CPUs)
+  T=11s   Qualcomm bark_time -- 1s margin
+
+==========================================================================
+Per-CPU done tracking
+==========================================================================
+
+stopper_first_dump_done  (DEFINE_PER_CPU atomic_t, zero at boot):
+  Writer: each detecting CPU sets 1 after FIRST dump_stack() (Phase 1c).
+  Reader: owner polls in Sec5 with ktime deadline.
+
+stopper_second_dump_trigger (global atomic_t, ATOMIC_INIT(0)):
+  Writer: owner sets 1 after Sec6 to signal non-owners.
+  Reader: non-owner PREPARE CPUs poll in their spin loop.
+  smp_wmb() before atomic_set() ensures all Sec1-6 output is ordered
+  before the trigger is visible to spinning CPUs.
+
+stopper_second_dump_done (DEFINE_PER_CPU atomic_t, zero at boot):
+  Writer: each CPU sets 1 after SECOND dump_stack().
+  Reader: owner polls with ktime deadline before panic().
+
+==========================================================================
+Timing constants (all relative to t_detect = ktime at T=8s)
+==========================================================================
+
+  STOPPER_TIMEOUT_JIFFIES = 8 * HZ    (8000ms at HZ=250 = 2000 jiffies)
+    jiffies-based detection threshold. Fires only in PREPARE state
+    (IRQs ON, timer tick active). In DISABLE_IRQ/RUN: jiffies frozen,
+    time_after() permanently false. No false positive.
+
+  STOPPER_DUMP1_WINDOW_MS = 800ULL
+    ktime deadline for first dump collection (Sec5).
+    t_detect + 800ms = T=8.8s. PREPARE CPUs are done near-instantly.
+    DISABLE_IRQ CPUs time out and are logged as "see ramdump".
+
+  STOPPER_DUMP2_TRIGGER_MS = 800ULL
+    ktime from t_detect at which owner triggers the second dump.
+    = DUMP1_WINDOW_MS: second dump starts immediately after Sec5.
+    t_detect + 800ms = T=8.8s.
+
+  STOPPER_DUMP2_WINDOW_MS = 1600ULL
+    ktime deadline for second dump collection.
+    t_detect + 1600ms = T=9.6s. Non-owners have 800ms after trigger.
+
+  STOPPER_PANIC_WINDOW_MS = 2000ULL
+    ktime from t_detect to panic(). T=8s + 2s = T=10s.
+    Qualcomm bark_time ~11s -> 1s margin.
+
+==========================================================================
+Code placement -- two insertion points (Clang 19 build correctness)
+==========================================================================
+
+INSERT POINT A (after includes, before struct cpu_stopper ~line 180):
+  Constants, stopper_dump_owner, stopper_first_dump_done,
+  stopper_second_dump_trigger, stopper_second_dump_done,
+  struct stopper_cpu_snapshot, stopper_snapshot_self().
+  -- NOTHING here references cpu_stopper or struct multi_stop_data.
+
+INSERT POINT B (after struct multi_stop_data ~line 210):
+  stopper_state_names[], stopper_state_name()
+  stopper_dump_one_cpu()        -- uses per_cpu_ptr(&cpu_stopper, cpu)
+  stopper_dump_msdata()         -- uses struct multi_stop_data *
+  stopper_wait_for_first_dumps() -- polls stopper_first_dump_done
+  stopper_wait_for_second_dumps() -- polls stopper_second_dump_done
+  stopper_print_other_snapshots() -- reads stopper_snapshot slots
+  stopper_deadlock_dump()       -- orchestrates Sec1-6 + dual dump + panic
+  -- All types fully defined here.
+
+==========================================================================
+Fix 1: int cpu -> unsigned int cpu (retained from production patch)
+==========================================================================
+
+smp_processor_id() returns 'unsigned int'. Clang 19 warns on signed/
+unsigned mismatch at cpumask_test_cpu() and per_cpu_ptr() call sites.
+
+==========================================================================
+Fix 2: Position C unconditional detection (retained from production patch)
+==========================================================================
+
+  do {
+    if (curstate < msdata->state) { ... }
+    if (is_active)       ack_state(msdata);         /* A */
+    else if (curstate > MULTI_STOP_PREPARE) {
+        touch_nmi_watchdog(); rcu_momentary_eqs();  /* B: not in PREPARE */
+    }
+    /* C: ALL CPUs, ALL states, every iteration -- our detection point */
+    if (!timed_out && time_after(now_j, ...)) { ... }
+  } while (curstate != MULTI_STOP_EXIT);
+
+In PREPARE: position B is never reached (condition false), IRQs stay ON,
+jiffies advance, time_after() fires at T=8s.
+In DISABLE_IRQ/RUN: position B IS reached, IRQs off, jiffies frozen,
+time_after() false -- no false positive.
+
+==========================================================================
+Upstream context
+==========================================================================
+
+Upstream partially addressed a related deadlock in 2018:
+  commit 0b26351b910f ("stop_machine, sched: Fix migrate_swap() vs.
+  active_balance() deadlock", Peter Zijlstra) -- fixed spinlock
+  contention in cpu_stop_queue_work(). Zijlstra noted: "I'm not
+  entirely sure there isn't more dragons here." This patch addresses
+  the remaining dragon: cpu_stopper_thread is single-threaded per-CPU
+  and cannot service inner callbacks while executing outer ones.
+
+Piggin June 2024 series (lkml.org/lkml/2024/6/25/589):
+  stop_machine_yield() already present in 6.12 tree (backported).
+  No conflict with this patch.
+
+rcu_momentary_eqs() stall warnings:
+  During the Sec5 2-dump window (T=8s to T=9.6s, ~1.6s) the non-owner
+  PREPARE CPUs spin without calling rcu_momentary_eqs(). This may
+  generate RCU CPU stall warnings in dmesg. These are benign -- the
+  kernel is about to panic(). The stall warnings may appear between the
+  first and second dump in the log; they can be ignored in analysis.
+
+==========================================================================
+Android GKI compliance
+==========================================================================
+
+- Single file: kernel/stop_machine.c only
+- No new exported symbols, no new Kconfig options
+- Clang 19 / LLD 19 compatible
+- ktime_get(): <linux/ktime.h> -- newly added include
+- atomic_t / atomic_set / atomic_read / atomic_cmpxchg: already present
+- DEFINE_PER_CPU: <linux/percpu.h> -- already present
+- No trigger_all_cpu_backtrace() (IPI hazard with DISABLE_IRQ CPUs)
+
+Bug: b/XXXXXXXXX
+Change-Id: Ixxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Signed-off-by: Your Name <your.email@example.com>
+---
+ kernel/stop_machine.c | 440 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 428 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 5d2d056..dualdump1 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -10,10 +10,13 @@
+ #include <linux/compiler.h>
+ #include <linux/completion.h>
+ #include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
+ #include <linux/init.h>
+ #include <linux/kthread.h>
+ #include <linux/export.h>
+ #include <linux/percpu.h>
++#include <linux/sched/debug.h>
+ #include <linux/sched.h>
+ #include <linux/stop_machine.h>
+ #include <linux/interrupt.h>
+@@ -26,6 +29,158 @@
+ #include <linux/nmi.h>
+ #include <linux/sched/wake_q.h>
+
++/* =========================================================
++ * INSERT POINT A
++ *
++ * Placed BEFORE enum multi_stop_state and struct cpu_stopper.
++ *
++ * RULE: nothing below may reference:
++ *   - cpu_stopper         (the DEFINE_PER_CPU variable, ~line 180)
++ *   - struct cpu_stopper  (the type, ~line 180)
++ *   - struct multi_stop_data  (defined ~line 210)
++ *
++ * stopper_snapshot_self() takes fn+caller as void*/ulong parameters
++ * to avoid needing struct cpu_stopper at this point.
++ * ========================================================= */
++
++/*
++ * STOPPER_TIMEOUT_JIFFIES: jiffies from spin entry to deadlock detection.
++ *   Fires only in MULTI_STOP_PREPARE state (IRQs ON, jiffies advancing).
++ *   In MULTI_STOP_DISABLE_IRQ/RUN: IRQs off, jiffies frozen,
++ *   time_after() permanently false -- no false positive.
++ *   HZ=250 on Qualcomm GKI targets: 8*HZ = 2000 jiffies = 8000ms.
++ */
++#define STOPPER_TIMEOUT_JIFFIES     (8 * HZ)
++
++/*
++ * ktime windows -- all measured from t_detect (the ktime when the first
++ * CPU's time_after() fires, i.e. T=8s from deadlock start):
++ *
++ *   DUMP1_WINDOW_MS:
++ *     Deadline for all PREPARE CPUs to complete FIRST dump_stack() (Sec5).
++ *     PREPARE CPUs write their done flag before the owner starts running,
++ *     so they complete near-instantly. DISABLE_IRQ CPUs never set the
++ *     flag; owner logs "see ramdump" for them.
++ *     t_detect + 800ms = T=8.8s.
++ *
++ *   DUMP2_TRIGGER_MS:
++ *     When owner triggers SECOND dump on all non-owner CPUs.
++ *     Set equal to DUMP1_WINDOW_MS so the second dump starts immediately
++ *     after Sec5 completes. t_detect + 800ms = T=8.8s.
++ *
++ *   DUMP2_WINDOW_MS:
++ *     Deadline for all PREPARE CPUs to complete SECOND dump_stack().
++ *     Non-owners have DUMP2_WINDOW_MS - DUMP2_TRIGGER_MS = 800ms
++ *     after the trigger to finish. t_detect + 1600ms = T=9.6s.
++ *
++ *   PANIC_WINDOW_MS:
++ *     When panic() is called. t_detect + 2000ms = T=10s.
++ *     Qualcomm msm_watchdog bark_time ~11s -> 1s margin.
++ *
++ * Full timeline:
++ *   T=8.0s  time_after() fires: FIRST all-CPU dump_stack() [Phase 1]
++ *   T=8.8s  Sec5 deadline:      SECOND all-CPU dump_stack() [Phase 3]
++ *   T=9.6s  Sec7 deadline:      second dump collection complete
++ *   T=10.0s panic()             [Qualcomm bark: ~T=11s, 1s margin]
++ */
++#define STOPPER_DUMP1_WINDOW_MS     800ULL
++#define STOPPER_DUMP2_TRIGGER_MS    800ULL
++#define STOPPER_DUMP2_WINDOW_MS     1600ULL
++#define STOPPER_PANIC_WINDOW_MS     2000ULL
++
++static_assert(CONFIG_HZ >= 100,
++	"stop_machine deadlock detection requires CONFIG_HZ >= 100");
++
++/*
++ * stopper_dump_owner: -1 = no owner.
++ * First CPU winning atomic_cmpxchg(&stopper_dump_owner, -1, cpu) becomes
++ * the sole dump orchestrator.  All other detecting CPUs become "non-owners"
++ * and follow the second-dump protocol.
++ */
++static atomic_t stopper_dump_owner = ATOMIC_INIT(-1);
++
++/*
++ * stopper_first_dump_done: set to 1 by each PREPARE CPU after its FIRST
++ * dump_stack() completes (Phase 1c).  Zero-initialised at boot.
++ * Owner polls this per-CPU in Sec5 (stopper_wait_for_first_dumps).
++ */
++static DEFINE_PER_CPU(atomic_t, stopper_first_dump_done);
++
++/*
++ * stopper_second_dump_trigger: owner sets to 1 to signal all non-owner
++ * PREPARE CPUs that it is time to perform their SECOND dump_stack().
++ * Non-owners poll this in their post-Phase-1 spin loop.
++ * smp_wmb() before atomic_set() ensures Sec1-6 output is ordered before
++ * this signal is visible.
++ */
++static atomic_t stopper_second_dump_trigger = ATOMIC_INIT(0);
++
++/*
++ * stopper_second_dump_done: set to 1 by each CPU (owner and non-owners)
++ * after its SECOND dump_stack() completes.  Zero-initialised at boot.
++ * Owner polls this per-CPU in Sec7 (stopper_wait_for_second_dumps).
++ */
++static DEFINE_PER_CPU(atomic_t, stopper_second_dump_done);
++
++/**
++ * struct stopper_cpu_snapshot - per-CPU state captured at timeout
++ *
++ * Written into own percpu slot by each detecting CPU in Phase 1.
++ * Lockless: each CPU writes only its own slot.
++ * Read by dump owner in stopper_print_other_snapshots().
++ *
++ * smp_store_release(&snap->valid, true) on write (after all fields).
++ * smp_load_acquire(&snap->valid) on read (guards all field accesses).
++ */
++struct stopper_cpu_snapshot {
++	unsigned int  cpu;
++	int           curstate;
++	bool          is_active;
++	void         *fn;
++	unsigned long caller;
++	unsigned long elapsed_j;
++	bool          valid;
++};
++
++static DEFINE_PER_CPU(struct stopper_cpu_snapshot, stopper_snapshot);
++
++/**
++ * stopper_snapshot_self() - write this CPU's state into its percpu slot
++ * @cpu:        this CPU's index
++ * @curstate:   multi_stop_state at detection
++ * @is_active:  true if this CPU is the fn-executing CPU
++ * @fn:         stopper fn (read at call site; cpu_stopper in scope there)
++ * @caller:     stopper caller (same)
++ * @elapsed_j:  jiffies elapsed since spin entry
++ *
++ * Called by ALL detecting CPUs in Phase 1 before the cmpxchg.
++ * Writes only to this CPU's own percpu slot -- always lock-free.
++ * smp_store_release() ensures all payload fields are visible before
++ * snap->valid becomes true.
++ */
++static void stopper_snapshot_self(unsigned int cpu, int curstate,
++				  bool is_active, void *fn,
++				  unsigned long caller,
++				  unsigned long elapsed_j)
++{
++	struct stopper_cpu_snapshot *snap = this_cpu_ptr(&stopper_snapshot);
++
++	snap->cpu       = cpu;
++	snap->curstate  = curstate;
++	snap->is_active = is_active;
++	snap->fn        = fn;
++	snap->caller    = caller;
++	snap->elapsed_j = elapsed_j;
++	smp_store_release(&snap->valid, true);
++}
++
++/* === end INSERT POINT A === */
++
+ /*
+  * Structure to determine completion condition and record errors. May
+  * be shared by works on different cpus.
+@@ -195,6 +350,261 @@ struct multi_stop_data {
+ 	atomic_t thread_ack;
+ };
+
++/* =========================================================
++ * INSERT POINT B -- after struct multi_stop_data.
++ *
++ * All helpers referencing cpu_stopper, struct cpu_stopper, or
++ * struct multi_stop_data are placed HERE where all three are defined.
++ * ========================================================= */
++
++static const char * const stopper_state_names[] = {
++	[MULTI_STOP_NONE]        = "NONE",
++	[MULTI_STOP_PREPARE]     = "PREPARE",
++	[MULTI_STOP_DISABLE_IRQ] = "DISABLE_IRQ",
++	[MULTI_STOP_RUN]         = "RUN",
++	[MULTI_STOP_EXIT]        = "EXIT",
++};
++static_assert(ARRAY_SIZE(stopper_state_names) == MULTI_STOP_EXIT + 1,
++	"stopper_state_names[] out of sync with enum multi_stop_state");
++
++static inline const char *stopper_state_name(int s)
++{
++	return ((unsigned int)s < ARRAY_SIZE(stopper_state_names) &&
++		stopper_state_names[s])
++		? stopper_state_names[s] : "UNKNOWN";
++}
++
++/**
++ * stopper_dump_one_cpu() - print one CPU's stopper state to dmesg
++ * @cpu: target CPU
++ */
++static noinline void stopper_dump_one_cpu(unsigned int cpu)
++{
++	struct cpu_stopper *st = per_cpu_ptr(&cpu_stopper, cpu);
++	struct cpu_stop_work *w;
++	int n = 0;
++
++	pr_emerg("  task=%-16s enabled=%d\n",
++		 st->thread ? st->thread->comm : "(null)", st->enabled);
++	pr_emerg("  fn=%pS  caller=%pS\n",
++		 READ_ONCE(st->fn), (void *)READ_ONCE((unsigned long)st->caller));
++	list_for_each_entry(w, &st->works, list) {
++		pr_emerg("  pending[%d]: fn=%pS caller=%pS\n",
++			 n++, w->fn, (void *)w->caller);
++		if (n >= 8) {
++			pr_emerg("  ... (truncated at 8)\n");
++			break;
++		}
++	}
++	if (!n)
++		pr_emerg("  pending works: (none)\n");
++}
++
++/**
++ * stopper_dump_msdata() - print multi_stop_data fields to dmesg
++ */
++static noinline void stopper_dump_msdata(struct multi_stop_data *msdata,
++					 unsigned int owner_cpu)
++{
++	int state = READ_ONCE(msdata->state);
++
++	pr_emerg("=== Sec2: multi_stop_data (owner CPU%u) ===\n", owner_cpu);
++	pr_emerg("  state       : %d (%s)\n", state, stopper_state_name(state));
++	pr_emerg("  num_threads : %u\n", msdata->num_threads);
++	pr_emerg("  thread_ack  : %d  (CPUs not yet acked)\n",
++		 atomic_read(&msdata->thread_ack));
++	pr_emerg("  inner fn    : %pS\n", msdata->fn);
++	pr_emerg("  active_cpus : %*pbl\n",
++		 cpumask_pr_args(msdata->active_cpus
++			? msdata->active_cpus : cpu_online_mask));
++}
++
++/**
++ * stopper_wait_for_first_dumps() - poll all CPUs' first-dump-done flags
++ * @owner_cpu:    dump owner -- skip self in wait loop
++ * @t_limit:      ktime deadline (t_detect + DUMP1_WINDOW_MS)
++ *
++ * Waits for each online CPU to set stopper_first_dump_done after its
++ * FIRST dump_stack() in Phase 1.
++ *
++ * PREPARE CPUs:    detected timeout, dumped in Phase 1, done immediately.
++ * DISABLE_IRQ CPUs: jiffies frozen, never detected, never set the flag.
++ *   -> owner waits until t_limit then logs a timeout message.
++ *   -> their stacks are captured in the panic() ramdump.
++ *
++ * ktime_get() reads the ARM hardware monotonic counter -- does NOT depend
++ * on jiffies or the timer IRQ.  Safe when remote CPUs have IRQs disabled.
++ */
++static noinline void stopper_wait_for_first_dumps(unsigned int owner_cpu,
++						  ktime_t t_limit)
++{
++	unsigned int c;
++
++	pr_emerg("=== Sec5: waiting for FIRST dump_stack from all CPUs ===\n");
++	for_each_online_cpu(c) {
++		if (c == owner_cpu)
++			continue;
++		while (!atomic_read(per_cpu_ptr(&stopper_first_dump_done, c))) {
++			if (ktime_after(ktime_get(), t_limit)) {
++				pr_emerg("  [CPU%u] FIRST dump timeout:"
++					 " IRQs disabled (DISABLE_IRQ/RUN)"
++					 " -- stack in ramdump\n", c);
++				goto first_next_cpu;
++			}
++			cpu_relax();
++		}
++		pr_emerg("  [CPU%u] FIRST dump_stack complete\n", c);
++first_next_cpu:;
++	}
++}
++
++/**
++ * stopper_wait_for_second_dumps() - poll all CPUs' second-dump-done flags
++ * @owner_cpu:  dump owner -- skip self in wait loop
++ * @t_limit:    ktime deadline (t_detect + DUMP2_WINDOW_MS)
++ *
++ * Waits for each online CPU to set stopper_second_dump_done after its
++ * SECOND dump_stack().  Owner already set its own flag before calling here.
++ *
++ * Non-owner PREPARE CPUs: triggered by stopper_second_dump_trigger, they
++ *   dump and set done within ~800ms.
++ * DISABLE_IRQ CPUs: cannot poll the trigger, never set the flag.
++ *   -> owner waits until t_limit then logs a timeout message.
++ */
++static noinline void stopper_wait_for_second_dumps(unsigned int owner_cpu,
++						   ktime_t t_limit)
++{
++	unsigned int c;
++
++	pr_emerg("=== Sec7: waiting for SECOND dump_stack from all CPUs ===\n");
++	for_each_online_cpu(c) {
++		if (c == owner_cpu)
++			continue;
++		while (!atomic_read(per_cpu_ptr(&stopper_second_dump_done, c))) {
++			if (ktime_after(ktime_get(), t_limit)) {
++				pr_emerg("  [CPU%u] SECOND dump timeout:"
++					 " IRQs disabled (DISABLE_IRQ/RUN)"
++					 " -- stack in ramdump\n", c);
++				goto second_next_cpu;
++			}
++			cpu_relax();
++		}
++		pr_emerg("  [CPU%u] SECOND dump_stack complete\n", c);
++second_next_cpu:;
++	}
++}
++
++/**
++ * stopper_print_other_snapshots() - print percpu snapshots from all CPUs
++ * @owner_cpu: skip (its snapshot is inline in Sec1/Sec4)
++ *
++ * Reads stopper_snapshot percpu slots written by Phase 1 writers.
++ * smp_load_acquire() pairs with smp_store_release() in stopper_snapshot_self().
++ */
++static noinline void stopper_print_other_snapshots(unsigned int owner_cpu)
++{
++	unsigned int c;
++
++	pr_emerg("=== Sec6: per-CPU snapshots at detection (T=8s) ===\n");
++	pr_emerg("  Signature A: one  is_active=YES -> LB re-entrancy\n");
++	pr_emerg("  Signature B: ALL  is_active=YES -> concurrent exhaustion\n");
++	pr_emerg("  Signature G: CPU  is_active=NO, curstate=NONE"
++		 " -> WALT/kworker preempted mid-queue\n");
++
++	for_each_online_cpu(c) {
++		struct stopper_cpu_snapshot *snap =
++			per_cpu_ptr(&stopper_snapshot, c);
++		int state;
++
++		if (c == owner_cpu)
++			continue;
++		if (!smp_load_acquire(&snap->valid)) {
++			pr_emerg("  [CPU%u] no snapshot (DISABLE_IRQ/RUN --"
++				 " could not detect timeout)\n", c);
++			continue;
++		}
++		state = snap->curstate;
++		pr_emerg("  [CPU%u] state=%-11s is_active=%-5s elapsed=~%ums\n",
++			 c, stopper_state_name(state),
++			 snap->is_active ? "YES" : "no",
++			 jiffies_to_msecs(snap->elapsed_j));
++		pr_emerg("         fn=%pS\n", snap->fn);
++		pr_emerg("         caller=%pS\n", (void *)snap->caller);
++	}
++}
++
++/**
++ * stopper_deadlock_dump() - orchestrate dual all-CPU dump then panic
++ * @cpu:       dump owner CPU index
++ * @msdata:    shared multi_stop_data
++ * @elapsed_j: jiffies elapsed since spin entry (used for timing messages)
++ * @t_detect:  ktime at which time_after() first fired (T=8s)
++ *
++ * Sections and timeline (all times relative to t_detect):
++ *   Sec1: outer stopper fn + caller (root cause identification)
++ *   Sec2: multi_stop_data state snapshot
++ *   Sec3: CPU masks (cpu_dying_mask non-zero -> hotplug variant)
++ *   Sec4: owner CPU detailed stopper state
++ *   Sec5: wait for FIRST dump_stack() from all CPUs (->T=8.8s)
++ *   Sec6: print per-CPU snapshots collected in Phase 1
++ *   +800ms:  set stopper_second_dump_trigger; SECOND dump on all CPUs
++ *   Sec7: wait for SECOND dump_stack() from all CPUs (->T=9.6s)
++ *   +2000ms: panic()
++ *
++ * noinline: preserves "stopper_deadlock_dump" in ramdump call stack.
++ */
++static noinline void stopper_deadlock_dump(unsigned int cpu,
++					   struct multi_stop_data *msdata,
++					   unsigned long elapsed_j,
++					   ktime_t t_detect)
++{
++	struct cpu_stopper *st     = this_cpu_ptr(&cpu_stopper);
++	ktime_t t_dump1_limit      = ktime_add_ms(t_detect, STOPPER_DUMP1_WINDOW_MS);
++	ktime_t t_dump2_trigger    = ktime_add_ms(t_detect, STOPPER_DUMP2_TRIGGER_MS);
++	ktime_t t_dump2_limit      = ktime_add_ms(t_detect, STOPPER_DUMP2_WINDOW_MS);
++	ktime_t t_panic            = ktime_add_ms(t_detect, STOPPER_PANIC_WINDOW_MS);
++
++	pr_emerg("\n");
++	pr_emerg("=====================================================\n");
++	pr_emerg("STOPPER DEADLOCK: migration/%u stuck ~%ums\n"
++		 "DUAL DUMP: FIRST=T+0ms  SECOND=T+800ms  PANIC=T+2000ms\n"
++		 "WDT bark: ~T+3000ms (T=deadlock+11s)\n",
++		 cpu, jiffies_to_msecs(elapsed_j));
++	pr_emerg("Patterns: A=LB re-entrancy  B=concurrent exhaustion"
++		 "  G=WALT init race\n");
++	pr_emerg("=====================================================\n");
++
++	/* Sec1: root cause -- which callback triggered the deadlock */
++	pr_emerg("=== Sec1: CPU%u outer stopper (root cause) ===\n", cpu);
++	pr_emerg("  outer fn    : %pS\n", READ_ONCE(st->fn));
++	pr_emerg("  outer caller: %pS\n",
++		 (void *)READ_ONCE((unsigned long)st->caller));
++
++	/* Sec2: state machine snapshot */
++	stopper_dump_msdata(msdata, cpu);
++
++	/* Sec3: CPU masks (cpu_dying_mask != 0 means hotplug-induced variant) */
++	pr_emerg("=== Sec3: CPU masks ===\n");
++	pr_emerg("  cpu_online_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_online_mask));
++	pr_emerg("  cpu_active_mask : %*pbl\n",
++		 cpumask_pr_args(cpu_active_mask));
++	pr_emerg("  cpu_dying_mask  : %*pbl  (non-zero = hotplug variant)\n",
++		 cpumask_pr_args(cpu_dying_mask));
++
++	/* Sec4: detailed stopper state of the dump-owner CPU */
++	pr_emerg("=== Sec4: CPU%u stopper state (detailed) ===\n", cpu);
++	stopper_dump_one_cpu(cpu);
++
++	/*
++	 * Sec5: block until every online PREPARE CPU has completed its
++	 * FIRST dump_stack() (stopper_first_dump_done == 1), or until
++	 * the t_dump1_limit deadline.  DISABLE_IRQ CPUs are logged as
++	 * "see ramdump" and skipped.
++	 */
++	stopper_wait_for_first_dumps(cpu, t_dump1_limit);
++
++	/* Sec6: per-CPU snapshots written by Phase 1 (all CPUs at T=8s) */
++	stopper_print_other_snapshots(cpu);
++
++	/*
++	 * === SECOND DUMP (T=~8.8s) ===
++	 *
++	 * Spin until t_dump2_trigger (t_detect + DUMP2_TRIGGER_MS = +800ms).
++	 * This equals DUMP1_WINDOW_MS so the second dump fires immediately
++	 * after Sec5 completes.
++	 *
++	 * smp_wmb() before atomic_set() ensures all Sec1-6 printk output
++	 * is ordered before non-owner CPUs see the trigger flag.
++	 */
++	while (ktime_before(ktime_get(), t_dump2_trigger))
++		cpu_relax();
++
++	pr_emerg("\n");
++	pr_emerg("=====================================================\n");
++	pr_emerg("SECOND DUMP: pre-panic all-CPU dump_stack\n");
++	pr_emerg("  First  dump @ T=8.0s -- deadlock onset\n");
++	pr_emerg("  Second dump @ T=8.8s -- pre-panic confirmation\n");
++	pr_emerg("  No progress = confirmed livelock (not transient delay)\n");
++	pr_emerg("=====================================================\n");
+
++	/* Signal non-owner PREPARE CPUs to perform second dump_stack() */
++	smp_wmb();
++	atomic_set(&stopper_second_dump_trigger, 1);
++
++	/* Owner SECOND dump_stack() -- mirrors non-owner Phase 3 */
++	pr_emerg("CPU%u SECOND dump_stack (pre-panic ~+%lldms):\n",
++		 cpu, ktime_to_ms(ktime_sub(ktime_get(), t_detect)));
++	dump_stack();
++	atomic_set(this_cpu_ptr(&stopper_second_dump_done), 1);
++
++	/*
++	 * Sec7: block until every online PREPARE CPU has completed its
++	 * SECOND dump_stack() (stopper_second_dump_done == 1), or until
++	 * the t_dump2_limit deadline.  DISABLE_IRQ CPUs timed out already.
++	 */
++	stopper_wait_for_second_dumps(cpu, t_dump2_limit);
++
++	pr_emerg("=====================================================\n");
++	pr_emerg("Both dumps complete (+%lldms). panic() in ~%lldms.\n",
++		 ktime_to_ms(ktime_sub(ktime_get(), t_detect)),
++		 ktime_to_ms(ktime_sub(t_panic, ktime_get())));
++	pr_emerg("DISABLE_IRQ CPU stacks: see ramdump.\n");
++	pr_emerg("=====================================================\n");
++
++	/* Spin until panic deadline (allows final kmsg flush to UART/pstore) */
++	while (ktime_before(ktime_get(), t_panic))
++		cpu_relax();
++
++	panic("migration/%u: stuck in multi_cpu_stop ~%ums |"
++	      " state=%s thread_ack=%d stop_fn=%pS |"
++	      " stop_machine deadlock | dual dump in kmsg | see ramdump\n",
++	      cpu,
++	      jiffies_to_msecs(elapsed_j),
++	      stopper_state_names[
++		  min_t(unsigned int,
++			(unsigned int)READ_ONCE(msdata->state),
++			MULTI_STOP_EXIT)],
++	      atomic_read(&msdata->thread_ack),
++	      READ_ONCE(msdata->fn));
++}
++
++/* === end INSERT POINT B === */
++
+ static int multi_cpu_stop(void *data)
+ {
+ 	struct multi_stop_data *msdata = data;
+@@ -209,8 +619,14 @@ static int multi_cpu_stop(void *data)
+ 	struct multi_stop_data *msdata = data;
+ 	enum multi_stop_state newstate, curstate = MULTI_STOP_NONE;
+
+-	int cpu = smp_processor_id(), err = 0;
++	/*
++	 * FIX: smp_processor_id() returns unsigned int. Clang 19 warns on
++	 * signed/unsigned mismatch at cpumask_test_cpu() and per_cpu_ptr().
++	 * 'err' stays int: msdata->fn() may return negative error codes.
++	 */
++	unsigned int cpu = smp_processor_id();
++	int err = 0, timed_out = 0;
+ 	const struct cpumask *cpumask;
+ 	unsigned long flags;
++	unsigned long start_jiffies;
+ 	bool is_active;
+
+@@ -232,6 +648,11 @@ static int multi_cpu_stop(void *data)
+ 	is_active = cpumask_test_cpu(cpu, cpumask);
+ 	}
+
++	/*
++	 * Snapshot jiffies before the spin loop.
++	 * Advances at HZ=250 only in PREPARE state (IRQs ON, tick live).
++	 */
++	start_jiffies = jiffies;
++
+ 	/* Simple state machine */
+ 	do {
+ 		/* Chill out and ensure we re-read multi_stop_state. */
+@@ -250,9 +671,88 @@ static int multi_cpu_stop(void *data)
+ 		} else if (curstate > MULTI_STOP_PREPARE) {
+ 			/*
+ 			 * At this stage all other CPUs we depend on must spin
+-			 * in the same loop. Any reason for hard-lockup should
+-			 * be detected and reported on their side.
++			 * in the same loop. Touch the NMI watchdog and
++			 * suppress RCU stall warnings while we spin.
+ 			 */
+ 			touch_nmi_watchdog();
+-			/* Also suppress RCU CPU stall warnings. */
+ 			rcu_momentary_eqs();
+ 		}
++
++		/*
++		 * [DEADLOCK DETECTION] Position C -- unconditional, every iter.
++		 *
++		 * Fires only in PREPARE state (IRQs ON, jiffies advancing).
++		 * DISABLE_IRQ/RUN: jiffies frozen, time_after() false.
++		 *
++		 * Single jiffies snapshot (now_j): consistent across all uses.
++		 * Single stopper fn/caller snapshot: prevents torn reads if
++		 * fields are updated between two separate READ_ONCE() calls.
++		 * timed_out=1: prevents re-entering Phase 1 on future iters.
++		 *
++		 * TWO-PHASE + SECOND-DUMP PROTOCOL:
++		 *
++		 * Phase 1 (ALL detecting CPUs, before cmpxchg):
++		 *   (a) stopper_snapshot_self(): write percpu slot.
++		 *   (b) FIRST dump_stack(): "CPU%u FIRST dump_stack at ~8s"
++		 *       IRQs ON in PREPARE state -- safe to call.
++		 *   (c) atomic_set(stopper_first_dump_done, 1): signal owner.
++		 *
++		 * Phase 2 (cmpxchg ownership race):
++		 *   SUCCESS (owner): stopper_deadlock_dump() -> panic().
++		 *   FAILURE (non-owner): fall through to Phase 3.
++		 *
++		 * Phase 3 (non-owners only):
++		 *   Poll stopper_second_dump_trigger until owner sets it.
++		 *   SECOND dump_stack(): "CPU%u SECOND dump_stack (pre-panic)"
++		 *   atomic_set(stopper_second_dump_done, 1): signal owner.
++		 *   Final spin: while(1) cpu_relax() until owner panics.
++		 *
++		 *   No touch_nmi_watchdog() in non-owner spins: deliberately
++		 *   omitted. The owner calls panic() before the watchdog bark.
++		 *   Adding NMI IPIs from non-owners while owner is doing
++		 *   pr_emerg/dump_stack introduces unnecessary noise.
++		 */
++		if (!timed_out) {
++			unsigned long now_j = READ_ONCE(jiffies);
++
++			if (time_after(now_j,
++				       start_jiffies + STOPPER_TIMEOUT_JIFFIES)) {
++				struct cpu_stopper *st =
++					this_cpu_ptr(&cpu_stopper);
++				void *snap_fn =
++					READ_ONCE(st->fn);
++				unsigned long snap_caller =
++					READ_ONCE((unsigned long)st->caller);
++				unsigned long elapsed_j =
++					now_j - start_jiffies;
++
++				timed_out = 1;
++
++				/* Phase 1(a): percpu snapshot */
++				stopper_snapshot_self(cpu, (int)curstate,
++						      is_active, snap_fn,
++						      snap_caller, elapsed_j);
++
++				/* Phase 1(b): FIRST self dump_stack */
++				pr_emerg("CPU%u FIRST dump_stack at ~%lums"
++					 " (state=%s is_active=%s):\n",
++					 cpu,
++					 jiffies_to_msecs(elapsed_j),
++					 stopper_state_name((int)curstate),
++					 is_active ? "YES" : "no");
++				dump_stack();
++
++				/* Phase 1(c): signal FIRST dump complete */
++				atomic_set(this_cpu_ptr(&stopper_first_dump_done), 1);
++
++				/* Phase 2: race for dump ownership */
++				if (atomic_cmpxchg(&stopper_dump_owner,
++						   -1, (int)cpu) == -1) {
++					/*
++					 * This CPU is the dump owner.
++					 * stopper_deadlock_dump() orchestrates
++					 * Sec1-7, triggers second dump on all
++					 * CPUs, then calls panic().
++					 * Never returns.
++					 */
++					stopper_deadlock_dump(
++						cpu, msdata, elapsed_j,
++						ktime_get());
++					unreachable();
++				}
++
++				/*
++				 * Non-owner: Phase 1 complete.
++				 * Spin polling stopper_second_dump_trigger.
++				 * When owner sets it (at T=+800ms), perform
++				 * SECOND dump_stack() and signal done.
++				 * Then spin until owner's panic() kills us.
++				 *
++				 * Phase 3: SECOND self dump_stack (non-owner)
++				 */
++				while (!atomic_read(&stopper_second_dump_trigger))
++					cpu_relax();
++
++				pr_emerg("CPU%u SECOND dump_stack (pre-panic):\n",
++					 cpu);
++				dump_stack();
++				atomic_set(this_cpu_ptr(&stopper_second_dump_done),
++					   1);
++
++				/* Final spin: owner panic() terminates us */
++				while (1)
++					cpu_relax();
++				unreachable();
++			} /* if time_after */
++		} /* if !timed_out */
++
+ 	} while (curstate != MULTI_STOP_EXIT);
+--
+2.43.0

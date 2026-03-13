@@ -1,0 +1,65 @@
+From: arm64-mthp-autopilot <mthp-autopilot@example.com>
+Subject: [PATCH v3.0] mm/huge_memory: read per-region hint, not per-pid
+
+The eBPF classifier now writes hint_map keyed by (pid<<32)|(addr>>21)
+instead of by pid alone.  Update the hook that reads it to match.
+
+Why: per-pid keying caused a hot tensor region's ORDER_2MB to
+contaminate the very next fresh region's first fault.  A stack
+region's first fault would read the tensor's hint and request 2MB
+pages it had not earned.  Per-region keying means each 2MB window
+earns and holds its own order independently.
+
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ thp_vma_allowable_order() — read eBPF hint @@
+
+ int thp_vma_allowable_order(struct vm_area_struct *vma,
+                              unsigned long vm_flags,
+                              unsigned long addr,
+                              unsigned long order)
+ {
++#ifdef CONFIG_MTHP_AUTOPILOT
++    /*
++     * v3.0: hint_map is keyed per-region: (pid << 32) | (addr >> 21).
++     * Each 2MB-aligned region holds its own fill-density order.
++     */
++    u64 rkey = ((u64)task_pid_nr(current) << 32) | (addr >> 21);
++    int ap_order = mthp_autopilot_preferred_order_by_key(rkey);
++    if (ap_order > 0 && ap_order > order)
++        order = ap_order;
++#endif
+     ...existing logic...
+ }
+
+--- a/include/linux/mthp_autopilot.h
++++ b/include/linux/mthp_autopilot.h
+@@ API @@
+
++/*
++ * mthp_autopilot_preferred_order_by_key() — v3.0 per-region API.
++ * @rkey: (pid << 32) | (fault_addr >> 21)
++ * Returns the hint order for this specific 2MB region, or 0 if none.
++ */
++int mthp_autopilot_preferred_order_by_key(u64 rkey);
+
+--- a/mm/mthp_autopilot.c
++++ b/mm/mthp_autopilot.c
+@@ implementation @@
+
++int mthp_autopilot_preferred_order_by_key(u64 rkey)
++{
++    struct hint_entry *he;
++    int order = 0;
++
++    spin_lock(&g_hint_lock);
++    hash_for_each_possible(g_hint_htab, he, node, (u32)rkey) {
++        if (he->key == rkey) {
++            order = he->order;
++            break;
++        }
++    }
++    spin_unlock(&g_hint_lock);
++    return order;
++}
++EXPORT_SYMBOL_GPL(mthp_autopilot_preferred_order_by_key);

@@ -1,0 +1,231 @@
+From: arm64-mthp-autopilot <mthp-autopilot@example.com>
+Date: Thu, 12 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ebpf: v3.0 — VMA-behaviour-driven promotion, remove name gating
+
+Zero-application-code-modification policy violation fix.
+
+PROBLEM
+=======
+v2.0 used process name (comm) as a gate on promotion order.
+Any ML application not in the hardcoded name list (darknet, onnxruntime,
+yolov8, inference_engine, detect, my_yolo, ...) was classified
+APPCLASS_GENERIC and received permanently degraded promotion:
+
+  VMA 512 KB–1 MB  →  ORDER_16KB  (should be ORDER_64KB)
+  VMA 4 MB–8 MB    →  ORDER_64KB  (should be ORDER_2MB)
+  hot_region ≥128  →  ORDER_64KB cap (should be ORDER_2MB)
+
+Additionally, the GENERIC early-exit (skip faults 1–4) created a cache
+starvation bug: any VMA first faulted during the skipped window was
+inserted into the VMA cache at ORDER_4KB and served 256 subsequent faults
+from that stale entry.
+
+PRINCIPLE
+=========
+The VMA is the classifier.  If a process has a 6 MB anonymous VMA,
+it wants large pages — regardless of whether it is named "python" or
+"darknet".  Anonymous + large = wants 2MB.  This is a physical fact
+about the memory access pattern, not a property of the process name.
+
+CHANGES
+=======
+
+1. classify_vma(): remove APPCLASS_GENERIC penalty for 512KB–1MB anon
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   OLD:
+     if (size >= 512KB) {
+         if (app_class != APPCLASS_GENERIC)
+             return ORDER_64KB;
+         return ORDER_16KB;  ← GENERIC gets 16KB
+     }
+
+   NEW:
+     if (size >= 512KB)
+         return ORDER_64KB;  ← everyone gets 64KB
+
+   Impact: any unknown ML process with a 512KB–1MB anonymous VMA (e.g.
+   intermediate activations, NCHW buffers) now gets 64KB pages.
+   64KB contiguous PTE = 16× TLB reach improvement on Cortex-A76.
+
+2. hot_region_adjust(): remove app_class gate at HOT_THRESHOLD_3
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   OLD:
+     if (fault_count >= 128) {
+         if (app_class == ML || Media || DB || Server)
+             order = ORDER_2MB;
+         else
+             order = ORDER_64KB;  ← GENERIC capped at 64KB forever
+     }
+
+   NEW:
+     if (fault_count >= 128)
+         order = ORDER_2MB;  ← any process, 128 faults = hot = 2MB
+
+   Impact: unknown ML processes that hammer the same memory region
+   (weight tensors, persistent activation buffers) now reach 2MB pages
+   after 128 faults to that 2MB-aligned region.
+
+   Rationale: 128 faults to a single 2MB region is empirical proof the
+   process is actively using that memory.  Process name is irrelevant
+   at this point — the access behaviour proves the classification.
+
+3. Remove GENERIC early-exit (faults 1–4 skip)
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   OLD:
+     if (cls->flags == APPCLASS_GENERIC && cls->total_faults < 4) {
+         cls->total_faults++;
+         return 0;  ← skip VMA lookup for first 4 faults
+     }
+
+   NEW:
+     (removed entirely)
+
+   The early-exit was added to save bpf_find_vma() cost on brand-new
+   GENERIC processes.  With the VMA cache, the fast path costs ~50 ns
+   (a hash lookup) after the first fault to a region.  The performance
+   gain from skipping 4 faults is negligible; the bug it created was not:
+
+   BUG: If a VMA was first accessed during faults 1–4 (while early-exit
+   was active), the VMA cache was NOT populated.  On fault 5, the fault
+   handler would do a full bpf_find_vma() and cache the result.  So far
+   so good.  But if fault 5 landed on a DIFFERENT VMA than faults 1–4,
+   the original VMA was never cached at all.  Subsequent faults to it
+   would each do bpf_find_vma() — the cache miss path — but worse, the
+   early-exit path had incremented total_faults without populating the
+   cache, so the LRU map for that VMA region showed miss but the count
+   was off, potentially falling back to 4KB permanently.
+
+4. vma_cache_entry_v3: store ideal_order not post-guard order
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   OLD:
+     cache->chosen_order = order;  ← stored after buddy guard applied
+
+   NEW:
+     cache->ideal_order = ideal;   ← stored before buddy guard
+
+   The buddy guard runs fresh on every fault from the cache_key.
+   Under v2.0, if fault N happened under fragmentation (buddy guard
+   stepped 2MB→64KB) and that post-guard result was cached, then faults
+   N+1 through N+255 would all be served ORDER_64KB even after
+   compaction restored plenty of 2MB blocks.
+
+   v3.0 caches the ideal (pre-guard) order.  The guard always runs fresh.
+   This means a hot tensor VMA that was temporarily stepped down due to
+   fragmentation automatically recovers to 2MB once memory is compacted.
+
+WHAT IS NOT CHANGED
+===================
+- classify_comm() is kept for the ONE remaining tiebreaker: anonymous
+  VMAs in the 4–8MB band.  Known ML/Media/DB apps get ORDER_2MB; others
+  get ORDER_64KB (still 16× improvement, and hot_region will upgrade
+  to 2MB after 128 faults if the region is actually hot).
+
+- The buddy guard itself is unchanged.  Memory safety is not relaxed.
+
+- File-backed VMA classification is unchanged.
+
+- The frag_index adaptive thresholds are unchanged.
+
+PROMOTION TABLE — v2.0 vs v3.0 for APPCLASS_GENERIC
+=====================================================
+
+  VMA size     | Type      | v2.0 order | v3.0 order | Gain
+  -------------|-----------|-----------|-----------|------------------------
+  64–128 KB    | anon      | 4KB       | 4KB       | (below THRESH_MIN)
+  128–512 KB   | anon      | 16KB      | 16KB      | same
+  512KB–1MB    | anon      | 16KB      | 64KB      | ← 4× TLB reach gain
+  1–4 MB       | anon      | 64KB      | 64KB      | same
+  4–8 MB       | anon      | 64KB      | 64KB      | same (tiebreaker zone)
+  8–32 MB      | anon      | 2MB       | 2MB       | same
+  ≥ 32 MB      | anon      | 2MB       | 2MB       | same
+  after 128 faults (hot)   | 64KB cap  | 2MB       | ← 32× TLB reach gain
+
+Signed-off-by: arm64-mthp-autopilot v3.0
+---
+ ebpf/auto_classifier_kern.c | multiple changes as described above
+
+diff --git a/ebpf/auto_classifier_kern.c b/ebpf/auto_classifier_kern.c
+--- a/ebpf/auto_classifier_kern.c  (v2.0)
++++ b/ebpf/auto_classifier_kern.c  (v3.0)
+
+@@ classify_vma() — anonymous 512KB-1MB band @@
+
+-    if (size >= (512 * 1024)) {
+-        /* v2.0: 64KB for all non-generic (was only ML/BROWSER) */
+-        if (app_class != APPCLASS_GENERIC)
+-            return ORDER_64KB;
+-        return ORDER_16KB;    /* ← BUG: GENERIC gets 16KB here */
+-    }
++    /* v3.0: 64KB for ALL processes at 512KB–1MB — no name discrimination */
++    if (size >= (512 * 1024))
++        return ORDER_64KB;
+
+@@ hot_region_adjust() — HOT_THRESHOLD_3 app_class gate @@
+
+-    if (hr->fault_count >= HOT_THRESHOLD_3 && base_order < ORDER_2MB) {
+-        /* Very hot: try 2MB if app class supports it */
+-        if (app_class == APPCLASS_ML ||
+-            app_class == APPCLASS_MEDIA ||
+-            app_class == APPCLASS_DATABASE ||
+-            app_class == APPCLASS_SERVER)
+-            order = ORDER_2MB;
+-        else
+-            order = ORDER_64KB;    /* ← BUG: GENERIC capped at 64KB */
+-    }
++    /* v3.0: 128 faults = hot = 2MB for ANY process */
++    if (hr->fault_count >= HOT_THRESHOLD_3 && order < ORDER_2MB)
++        order = ORDER_2MB;
+
+@@ hot_region_adjust() — function signature @@
+
+-static __always_inline __u32
+-hot_region_adjust(__u32 pid, __u64 addr, __u32 base_order, __u32 app_class)
++static __always_inline __u32
++hot_region_adjust(__u32 pid, __u64 addr, __u32 base_order)
++/* app_class parameter removed — no longer used in the hot path */
+
+@@ auto_classify_fault() — remove GENERIC early-exit @@
+
+-    /*
+-     * v2.0: Early exit for GENERIC with < 4 faults (was 8).
+-     */
+-    if (cls->flags == APPCLASS_GENERIC && cls->total_faults < 4) {
+-        cls->total_faults++;
+-        return 0;
+-    }
+
+@@ vma_cache_entry — store ideal_order separately @@
+
+-struct vma_cache_entry {
+-    __u32 pid;
+-    __u32 chosen_order;   /* ← post-guard order (bug: caches fragmentation) */
++struct vma_cache_entry_v3 {
++    __u32 pid;
++    __u32 ideal_order;    /* ← pre-guard order (v3.0: guard runs fresh) */
+     __u64 vma_start;
+     __u64 vma_end;
+     __u64 vma_flags;
+     __u32 app_class;
+     __u32 hit_count;
+     __u32 fault_count;
+     __u32 _pad;
+ };
+
+@@ cache hit path — use ideal_order @@
+
+-        order   = cached->chosen_order;
+-        ideal   = order;
++        ideal   = cached->ideal_order;   /* pre-guard ideal */
++        order   = ideal;
+         /* buddy guard still runs below — no caching of guard result */
+
+@@ cache populate — store ideal not post-guard @@
+
+         struct vma_cache_entry new_cache = {
+             .pid          = pid,
+-            .chosen_order = order,  /* was post-guard */
++            .ideal_order  = ideal,  /* v3.0: store pre-guard */

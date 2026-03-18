@@ -1,0 +1,41 @@
+diff --git a/drivers/usb/dwc3/dwc3_msm_kretprobe.c b/drivers/usb/dwc3/dwc3_msm_kretprobe.c
+--- a/drivers/usb/dwc3/dwc3_msm_kretprobe.c
++++ b/drivers/usb/dwc3/dwc3_msm_kretprobe.c
+@@ -382,10 +382,10 @@ static int dwc3_tp_register_all(void)
+ 	/* Confirmed: trace.h:150 DEFINE_EVENT(dwc3_log_request, dwc3_alloc_request */
+ 	REG_TP(dwc3_alloc_request,     dwc3_tp_log_request_cb)
+ 	/* Confirmed: trace.h:228 DEFINE_EVENT(dwc3_log_gadget_ep_cmd, dwc3_gadget_ep_cmd */
+ 	REG_TP(dwc3_gadget_ep_cmd,     dwc3_tp_log_gadget_ep_cmd_cb)
+-	/* TODO: verify — grep "DEFINE_EVENT.*dwc3_log_trb"   drivers/usb/dwc3/trace.h */
++	/* TODO: verify — grep "DEFINE_EVENT.*log_trb" drivers/usb/dwc3/trace.h */
+ 	REG_TP(dwc3_log_trb,           dwc3_tp_log_trb_cb)
+-	/* TODO: verify — grep "DEFINE_EVENT.*dwc3_log_event" drivers/usb/dwc3/trace.h */
+-	REG_TP(dwc3_log_event,         dwc3_tp_log_event_cb)
+-	/* TODO: verify — grep "DEFINE_EVENT.*dwc3_log_ep"    drivers/usb/dwc3/trace.h */
++	/* Confirmed: trace.h:84 DEFINE_EVENT(dwc3_log_event, dwc3_event */
++	REG_TP(dwc3_event,             dwc3_tp_log_event_cb)
++	/* TODO: verify — grep "DEFINE_EVENT.*log_ep" drivers/usb/dwc3/trace.h */
+ 	REG_TP(dwc3_log_ep,            dwc3_tp_log_ep_cb)
+ #undef REG_TP
+ 	return 0;
+@@ -397,10 +397,10 @@ static void dwc3_tp_unregister_all(void)
+ 	unregister_trace_dwc3_alloc_request(
+ 			dwc3_tp_log_request_cb, NULL);
+ 	unregister_trace_dwc3_gadget_ep_cmd(
+ 			dwc3_tp_log_gadget_ep_cmd_cb, NULL);
+-	/* TODO: update if DEFINE_EVENT instance name differs */
++	/* TODO: verify — grep "DEFINE_EVENT.*log_trb" drivers/usb/dwc3/trace.h */
+ 	unregister_trace_dwc3_log_trb(
+ 			dwc3_tp_log_trb_cb, NULL);
+-	unregister_trace_dwc3_log_event(
++	/* Confirmed: trace.h:84 DEFINE_EVENT(dwc3_log_event, dwc3_event */
++	unregister_trace_dwc3_event(
+ 			dwc3_tp_log_event_cb, NULL);
+-	unregister_trace_dwc3_log_ep(
++	/* TODO: verify — grep "DEFINE_EVENT.*log_ep" drivers/usb/dwc3/trace.h */
++	unregister_trace_dwc3_log_ep(
+ 			dwc3_tp_log_ep_cb, NULL);
+ 	tracepoint_synchronize_unregister();
+ }
+-- 
+2.34.1

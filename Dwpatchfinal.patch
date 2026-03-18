@@ -1,91 +1,52 @@
-INFO: Analyzed 5 targets (67 packages loaded, 126330 targets configured).                                                             [58/1989]
-ERROR: /local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/soc-repo/BUILD.bazel:343:14: Building DDK module (consolidate.fragment;not
-rim;zstd_dwarf_compression_disabled) //soc-repo:vienna_consolidate/drivers/usb/dwc3/dwc3-msm failed: (Exit 2): bash failed: error executing Ker
-nelModule command (from target //soc-repo:vienna_consolidate/drivers/usb/dwc3/dwc3-msm) /bin/bash -c ... (remaining 1 argument skipped)
-
-Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
-WARNING: Using kernel_env without makefile is deprecated and will trigger
-         a warning/error in the future.
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:391:2: error: call to undeclared function 'register_trace_FIX_TRB'; ISO C99 and later do
-not support implicit function declarations [-Wimplicit-function-declaration]
-  391 |         REG_TP(FIX_TRB,           dwc3_tp_log_trb_cb)
-      |         ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:383:8: note: expanded from macro 'REG_TP'
-  383 |         ret = register_trace_##name(cb, NULL); \
-      |               ^
-<scratch space>:24:1: note: expanded from here
-   24 | register_trace_FIX_TRB
-      | ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:393:2: error: call to undeclared function 'register_trace_FIX_EB'; ISO C99 and later do n
-ot support implicit function declarations [-Wimplicit-function-declaration]
-  393 |         REG_TP(FIX_EB,            dwc3_tp_log_ep_cb)
-      |         ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:383:8: note: expanded from macro 'REG_TP'
-  383 |         ret = register_trace_##name(cb, NULL); \
-      |               ^
-<scratch space>:28:1: note: expanded from here
-   28 | register_trace_FIX_EB
-      | ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:404:2: error: call to undeclared function 'unregister_trace_FIX_TRB'; ISO C99 and later d
-o not support implicit function declarations [-Wimplicit-function-declaration]
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/exe[21/1989]
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:404:2: note: did you mean 'unregister_ftrace_direct'?
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/include/linux/ftrace.h:439:19: note: 'unregister_ftrace_direct' declared here
-  439 | static inline int unregister_ftrace_direct(struct ftrace_ops *ops, unsigned long addr,
-      |                   ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:406:2: error: call to undeclared function 'unregister_trace_dwc3_log_event'; ISO C99 and
-later do not support implicit function declarations [-Wimplicit-function-declaration]
-  406 |         unregister_trace_dwc3_log_event(
-      |         ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:406:2: note: did you mean 'unregister_trace_dwc3_event'?
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/drivers/usb/dwc3/trace.h:84:1: note: 'unregister_trace_dwc3_event' declared here
-   84 | DEFINE_EVENT(dwc3_log_event, dwc3_event,
-      | ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/include/linux/tracepoint.h:596:2: note: expanded from macro 'DEFINE_EVENT'
-  596 |         DECLARE_TRACE(name, PARAMS(proto), PARAMS(args))
-      |         ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/include/linux/tracepoint.h:473:2: note: expanded from macro 'DECLARE_TRACE'
-  473 |         __DECLARE_TRACE(name, PARAMS(proto), PARAMS(args),              \
-      |         ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/include/linux/tracepoint.h:321:2: note: expanded from macro '__DECLARE_TRACE'
-  321 |         unregister_trace_##name(void (*probe)(data_proto), void *data)  \
-      |         ^
-<scratch space>:12:1: note: expanded from here
-   12 | unregister_trace_dwc3_event
-      | ^
-/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/1/execroot/_ma
-in/common/../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.c:408:2: error: call to undeclared function 'unregister_trace_FIX_EB'; ISO C99 and later do
- not support implicit function declarations [-Wimplicit-function-declaration]
-  408 |         unregister_trace_FIX_EB(
-      |         ^
-5 errors generated.
-make[4]: *** [/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/
-1/execroot/_main/common/scripts/Makefile.build:240: ../soc-repo/drivers/usb/dwc3/dwc3-msm-ops.o] Error 1
-make[4]: *** Waiting for unfinished jobs....
-make[3]: *** [/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/
-1/execroot/_main/common/Makefile:1996: ../soc-repo] Error 2
-make[2]: *** [/local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/bazel-cache/d3411d080c2e3f878878b884f711a19a/sandbox/linux-sandbox/
-1/execroot/_main/common/Makefile:242: __sub-make] Error 2
-make[1]: *** [Makefile:242: __sub-make] Error 2
-make: *** [Makefile:52: modules] Error 2
-Use --verbose_failures to see the command lines of failed build steps.
-ERROR: /local/mnt/workspace/sburadka/ASPEN_MIGRATION/kernel_platform/soc-repo/BUILD.bazel:343:14 Middleman _middlemen/soc-repo_Svienna_Uconsoli
-date_Udist-runfiles failed: (Exit 2): bash failed: error executing KernelModule command (from target //soc-repo:vienna_consolidate/drivers/usb/
-dwc3/dwc3-msm) /bin/bash -c ... (remaining 1 argument skipped)
-
-Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
-INFO: Elapsed time: 27.496s, Critical Path: 10.13s
-INFO: 2 processes: 3699 action cache hit, 2 internal.
-ERROR: Build did NOT complete successfully
+--- a/drivers/usb/dwc3/dwc3_msm_kretprobe.c
++++ b/drivers/usb/dwc3/dwc3_msm_kretprobe.c
+@@ -255,18 +255,6 @@ static void dwc3_tp_log_gadget_ep_cmd_cb(void *d, struct dwc3_ep *dep,
+ 	dbg_trace_gadget_ep_cmd(dep, cmd, param, cmd_status);
+ }
+ 
+-static void dwc3_tp_log_trb_cb(void *d, struct dwc3_ep *dep,
+-	struct dwc3_trb *trb)
+-{
+-	dbg_trace_trb_prepare(dep, trb);
+-}
+-
+ static void dwc3_tp_log_event_cb(void *d, u32 event, struct dwc3 *dwc)
+ {
+ 	dbg_trace_event(event, dwc);
+ }
+ 
+-static void dwc3_tp_log_ep_cb(void *d, struct dwc3_ep *dep)
+-{
+-	dbg_trace_ep(dep);
+-}
+-
+ static int dwc3_tp_register_all(void)
+ {
+ 	int ret;
+@@ -278,11 +266,9 @@ static int dwc3_tp_register_all(void)
+ 	REG_TP(dwc3_alloc_request,     dwc3_tp_log_request_cb)
+ 	REG_TP(dwc3_gadget_ep_cmd,     dwc3_tp_log_gadget_ep_cmd_cb)
+-	REG_TP(FIX_TRB,           dwc3_tp_log_trb_cb)
++	/* dwc3_log_trb: no DEFINE_EVENT instance in vendor trace.h — removed */
+ 	REG_TP(dwc3_event,         dwc3_tp_log_event_cb)
+-	REG_TP(FIX_EB,            dwc3_tp_log_ep_cb)
++	/* dwc3_log_ep: no DEFINE_EVENT instance in vendor trace.h — removed */
+ #undef REG_TP
+ 	return 0;
+ }
+@@ -292,12 +278,10 @@ static void dwc3_tp_unregister_all(void)
+ 	unregister_trace_dwc3_alloc_request(
+ 			dwc3_tp_log_request_cb, NULL);
+ 	unregister_trace_dwc3_gadget_ep_cmd(
+ 			dwc3_tp_log_gadget_ep_cmd_cb, NULL);
+-	unregister_trace_FIX_TRB(
+-			dwc3_tp_log_trb_cb, NULL);
+-	unregister_trace_dwc3_log_event(
++	/* dwc3_log_trb removed — no instance in vendor trace.h */
++	unregister_trace_dwc3_event(
+ 			dwc3_tp_log_event_cb, NULL);
+-	unregister_trace_FIX_EB(
+-			dwc3_tp_log_ep_cb, NULL);
++	/* dwc3_log_ep removed — no instance in vendor trace.h */
+ 	tracepoint_synchronize_unregister();
+ }

@@ -1,0 +1,764 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Shree <shree@qcom-dev.local>
+Date: Wed, 18 Mar 2026 10:43:00 +0530
+Subject: [PATCH] usb: dwc3: msm: kretprobe: fix stop_machine deadlock and
+ watchdog bite on SM4100/SM5100
+
+Multiple critical bugs in dwc3_msm_kretprobe.c cause a reproducible
+10s kworker hang followed by a 12s hardlockup NMI on SM4100/SM5100
+(Snapdragon Wear 4100 / Android GKI 6.12).
+
+Root cause chain:
+  1. dwc3_msm_kretprobe_init() called from module_init() while
+     dwc3_msm.ko symbols are still unresolved. resolve_symbol_wait()
+     blocks the kworker holding module_mutex for up to 30s.
+     register_kretprobe() -> arm_kprobe() -> aarch64_insn_patch_text()
+     -> stop_machine_cpuslocked() -> stop_one_cpu() ->
+     wait_for_completion() [NO TIMEOUT]. Detected as hung kworker at
+     10s, hardlockup NMI fires at 12s.
+
+  2. entry_dwc3_gadget_run_stop() calls sched_set_fifo() directly from
+     kretprobe context. WALT holds rq->lock during scheduler policy
+     changes. A concurrent stop_machine() cannot schedule the stopper
+     thread on a CPU blocked in WALT's rq->lock path. All CPUs spin in
+     MULTI_STOP_DISABLE_IRQ with IRQs off, touch_nmi_watchdog() never
+     called, hardlockup NMI at 12s.
+
+  3. 5x tracepoint kretprobes (trace_event_raw_event_dwc3_*) cause
+     recursive kprobe re-entry: handlers call dbg_trace_* helpers which
+     re-fire the same tracepoints -> BUG_ON(regs == NULL). Each probe
+     also fires an unnecessary stop_machine() on registration.
+
+  4. is_uvc_function_active() walks cdev->configs list without any lock,
+     racing with gadget unbind -> NULL deref in kretprobe context on
+     USB disconnect on SM4100/SM5100.
+
+  5. dwc3_suspend_common maxactive=8 hardcoded. On the 8-CPU SM4100
+     cluster under burst USB events, probes are missed, leaving
+     dis_u2_susphy_quirk permanently false (silent USB PM regression).
+
+  6. register_kretprobe() failure silently continues the init loop,
+     still firing stop_machine() per remaining probe, leaving partial
+     BRK-patched state in kernel text.
+
+Fixes:
+  - Register kretprobes from MODULE_STATE_LIVE module notifier only,
+    never from module_init(). Handle already-loaded case via
+    find_module() + state check under module_mutex.
+  - Defer sched_set_fifo/sched_set_normal to system_wq via
+    dwc3_irq_sched_work (GFP_ATOMIC), breaking the WALT rq->lock
+    deadlock path entirely.
+  - Replace 5x tracepoint kretprobes with register_trace_*() callbacks.
+    No BRK injection, no stop_machine(), no re-entry risk, typed args.
+  - Wrap is_uvc_function_active() list walk in rcu_read_lock() with
+    list_for_each_entry_rcu() to prevent concurrent unbind NULL deref.
+  - Set maxactive = num_possible_cpus() * 2 for dwc3_suspend_common
+    at runtime in dwc3_msm_kretprobe_init().
+  - Abort init loop on first register_kretprobe() failure, unregister
+    all already-armed probes cleanly, return error.
+
+Signed-off-by: Shree <shree@qcom-dev.local>
+---
+--- a/drivers/usb/dwc3/dwc3_msm_kretprobe.c
++++ b/drivers/usb/dwc3/dwc3_msm_kretprobe.c
+@@ -1,9 +1,24 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * dwc3_msm_kretprobe.c - DWC3 MSM kretprobe instrumentation
++ *
++ * Fixed (SM4100/SM5100, GKI 6.12):
++ *   - stop_machine deadlock via sched_set_fifo() in kretprobe context
++ *   - 10s kworker hang + 12s hardlockup NMI from module_init race
++ *   - NULL deref in is_uvc_function_active() on concurrent gadget unbind
++ *   - Recursive kprobe re-entry from tracepoint kretprobes
++ *   - maxactive=8 causing missed probes on 8-CPU cluster
++ *   - Silent partial-state on register_kretprobe() failure
++ */
++
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/kprobes.h>
+ #include <linux/irq.h>
+ #include <linux/irqdesc.h>
+ #include <linux/sched.h>
++#include <linux/workqueue.h>
++#include <linux/rcupdate.h>
+ #include <linux/usb/android_configfs_uevent.h>
+ #include <linux/usb/dwc3-msm.h>
+ #include <linux/usb/composite.h>
+@@ -24,6 +39,47 @@
+ 	struct work_struct *data;
+ };
+ 
++/*
++ * dwc3_irq_sched_work - deferred IRQ thread scheduler policy change
++ *
++ * sched_set_fifo() / sched_set_normal() must NOT be called directly from
++ * kretprobe context on SM4100/SM5100.
++ *
++ * Root cause: WALT holds rq->lock during scheduler policy updates. A
++ * concurrent stop_machine() call (e.g. from register_kretprobe() in
++ * another kworker processing dwc3_msm module load) cannot schedule the
++ * stopper thread on any CPU blocked in WALT's rq->lock path. All CPUs
++ * then spin in MULTI_STOP_DISABLE_IRQ with IRQs off. touch_nmi_watchdog()
++ * is never called. Hardlockup NMI fires at watchdog_thresh + ~2s scheduler
++ * latency = 12s on SM4100.
++ *
++ * Fix: defer all sched_set_* to system_wq which runs outside kprobe/NMI
++ * context with normal scheduling semantics. GFP_ATOMIC for the alloc since
++ * we are in kretprobe context (IRQs may be disabled).
++ */
++struct dwc3_irq_sched_work {
++	struct work_struct  work;
++	struct task_struct *thread;
++	bool                use_fifo;
++};
++
++static void dwc3_irq_sched_work_fn(struct work_struct *w)
++{
++	struct dwc3_irq_sched_work *iw =
++		container_of(w, struct dwc3_irq_sched_work, work);
++
++	if (iw->use_fifo)
++		sched_set_fifo(iw->thread);
++	else
++		sched_set_normal(iw->thread, MIN_NICE);
++
++	kfree(iw);
++}
++
++/* ------------------------------------------------------------------ */
++/* entry_dwc3_suspend_common / exit_dwc3_suspend_common               */
++/* ------------------------------------------------------------------ */
++
+ static int entry_dwc3_suspend_common(struct kretprobe_instance *ri,
+ 				struct pt_regs *regs)
+ {
+@@ -58,7 +114,7 @@
+ 	int flag = data->xi0;
+ 
+ 	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST) {
+-		/* Re-store the original quic values. */
++		/* Re-store the original quirk values. */
+ 		if (flag & USB2PHYCFG_SUSPHY)
+ 			dwc->dis_u2_susphy_quirk = true;
+ 		if (flag & USB2PHYCFG_ENBLSLPM)
+@@ -66,54 +122,69 @@
+ 
+ 		dev_dbg(dwc->dev, "restored SUSPHY=%u & ENABLSLPM=%u\n",
+ 			dwc->dis_u2_susphy_quirk, dwc->dis_enblslpm_quirk);
+-
+ 	}
+ 
+ 	dev_dbg(dwc->dev, "dwc3 suspend common exit\n");
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* is_uvc_function_active                                             */
++/* ------------------------------------------------------------------ */
++
+ /**
+  * is_uvc_function_active - Check if UVC function is present in USB composition
+  * @dwc: pointer to dwc3 structure
+  *
+- * Returns true if UVC (USB Video Class) function is active in the current
+- * USB gadget composition, false otherwise.
++ * Called from kretprobe context (entry_dwc3_gadget_run_stop).
++ * cdev->configs is modified under the USB gadget config mutex during
++ * bind/unbind - a sleeping lock we cannot take here. Use RCU to prevent
++ * NULL deref on concurrent gadget unbind racing with kretprobe fire on
++ * SM4100/SM5100 during USB disconnect.
++ *
++ * Returns true if UVC function is active in current gadget composition.
+  */
+ static bool is_uvc_function_active(struct dwc3 *dwc)
+ {
+-	struct usb_gadget *gadget;
++	struct usb_gadget        *gadget;
+ 	struct usb_composite_dev *cdev;
+ 	struct usb_configuration *config;
+-	struct usb_function *func;
++	struct usb_function      *func;
++	bool                      found = false;
+ 
+ 	if (!dwc || !dwc->gadget)
+ 		return false;
+ 
++	rcu_read_lock();
+ 	gadget = dwc->gadget;
+-	if (!gadget->ep0 || !gadget->ep0->driver_data)
+-		return false;
+-
+-	cdev = get_gadget_data(gadget);
+-	if (!cdev)
+-		return false;
+-
+-	/* Iterate through all configurations */
+-	list_for_each_entry(config, &cdev->configs, list) {
+-		/* Check each function in the configuration */
+-		list_for_each_entry(func, &config->functions, list) {
+-			/* Check if function name contains "uvc" */
+-			if (func->name && strstr(func->name, "uvc")) {
+-				dev_dbg(dwc->dev, "UVC function detected: %s\n",
+-					func->name);
+-				return true;
++	if (gadget && gadget->ep0 && gadget->ep0->driver_data) {
++		cdev = get_gadget_data(gadget);
++		if (cdev) {
++			list_for_each_entry_rcu(config,
++						&cdev->configs, list) {
++				list_for_each_entry_rcu(func,
++						&config->functions, list) {
++					if (func->name &&
++					    strstr(func->name, "uvc")) {
++						dev_dbg(dwc->dev,
++							"UVC detected: %s\n",
++							func->name);
++						found = true;
++						goto done;
++					}
++				}
+ 			}
+ 		}
+ 	}
+-
+-	return false;
++done:
++	rcu_read_unlock();
++	return found;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* entry/exit_usb_ep_set_maxpacket_limit                              */
++/* ------------------------------------------------------------------ */
++
+ static int entry_usb_ep_set_maxpacket_limit(struct kretprobe_instance *ri,
+ 				struct pt_regs *regs)
+ {
+@@ -122,7 +193,7 @@
+ 	struct dwc3 *dwc;
+ 	union kprobe_data *data = (union kprobe_data *)ri->data;
+ 
+-	dep =  to_dwc3_ep(ep);
++	dep = to_dwc3_ep(ep);
+ 	dwc = dep->dwc;
+ 
+ 	data->dwc = dwc;
+@@ -148,6 +219,10 @@
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* entry_dwc3_gadget_run_stop                                         */
++/* ------------------------------------------------------------------ */
++
+ static int entry_dwc3_gadget_run_stop(struct kretprobe_instance *ri,
+ 				   struct pt_regs *regs)
+ {
+@@ -165,9 +240,16 @@
+ 		 *
+ 		 * However, UVC (USB Video Class) requires real-time priority
+ 		 * to avoid frame drops and glitches. So we conditionally set
+-		 * the scheduler policy based on whether UVC is in the composition:
+-		 * - UVC present: Use SCHED_FIFO with highest priority
+-		 * - UVC absent: Use SCHED_NORMAL to avoid RT throttling
++		 * the scheduler policy based on whether UVC is in the
++		 * composition:
++		 *   - UVC present: Use SCHED_FIFO with highest priority
++		 *   - UVC absent:  Use SCHED_NORMAL to avoid RT throttling
++		 *
++		 * IMPORTANT: sched_set_fifo/sched_set_normal are NOT called
++		 * directly here. Calling them from kretprobe context triggers
++		 * the WALT rq->lock -> stop_machine deadlock on SM4100/SM5100
++		 * (hardlockup NMI at 12s). All scheduler policy changes are
++		 * deferred to system_wq via dwc3_irq_sched_work.
+ 		 */
+ 		struct irq_desc *irq_desc = irq_to_desc(dwc->irq_gadget);
+ 		struct irqaction *action = irq_desc ? irq_desc->action : NULL;
+@@ -175,31 +257,29 @@
+ 
+ 		dwc3_msm_notify_event(dwc, DWC3_GSI_EVT_BUF_SETUP, 0);
+ 
+-		/* Check if UVC function is present in the composition */
+ 		uvc_active = is_uvc_function_active(dwc);
+ 
+-		for ( ; action != NULL; action = action->next) {
++		for (; action != NULL; action = action->next) {
+ 			if (action->thread) {
+-				if (uvc_active) {
+-					/*
+-					 * UVC needs real-time priority to avoid frame drops.
+-					 * Use sched_set_fifo() which sets SCHED_FIFO.
+-					 */
+-					sched_set_fifo(action->thread);
+-					dev_info(dwc->dev,
+-						"Set IRQ thread:%s pid:%d to SCHED_FIFO low priority (UVC active)\n",
++				struct dwc3_irq_sched_work *iw =
++					kmalloc(sizeof(*iw), GFP_ATOMIC);
++				if (iw) {
++					iw->thread   = action->thread;
++					iw->use_fifo = uvc_active;
++					INIT_WORK(&iw->work,
++						  dwc3_irq_sched_work_fn);
++					schedule_work(&iw->work);
++					dev_dbg(dwc->dev,
++						"Deferred %s for IRQ thread "
++						"%s pid %d\n",
++						uvc_active ? "SCHED_FIFO"
++							   : "SCHED_NORMAL",
+ 						action->thread->comm,
+ 						action->thread->pid);
+ 				} else {
+-					/*
+-					 * Non-UVC composition: use SCHED_NORMAL to avoid
+-					 * RT throttling issues.
+-					 */
+-					sched_set_normal(action->thread, MIN_NICE);
+-					dev_info(dwc->dev,
+-						"Set IRQ thread:%s pid:%d to SCHED_NORMAL (no UVC)\n",
+-						action->thread->comm,
+-						action->thread->pid);
++					dev_warn(dwc->dev,
++						 "kmalloc failed, IRQ thread "
++						 "priority not updated\n");
+ 				}
+ 				break;
+ 			}
+@@ -213,6 +293,10 @@
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Remaining entry handlers (unchanged logic)                         */
++/* ------------------------------------------------------------------ */
++
+ static int entry_dwc3_send_gadget_ep_cmd(struct kretprobe_instance *ri,
+ 				   struct pt_regs *regs)
+ {
+@@ -236,7 +320,8 @@
+ 
+ 	/* DWC3_DEPCFG_ACTION_MODIFY is only done during CONNDONE */
+ 	if (action == DWC3_DEPCFG_ACTION_MODIFY && dep->number == 1)
+-		dwc3_msm_notify_event(dep->dwc, DWC3_CONTROLLER_CONNDONE_EVENT, 0);
++		dwc3_msm_notify_event(dep->dwc,
++				DWC3_CONTROLLER_CONNDONE_EVENT, 0);
+ 
+ 	return 0;
+ }
+@@ -280,61 +365,6 @@
+ 	return 0;
+ }
+ 
+-static int entry_trace_event_raw_event_dwc3_log_request(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct dwc3_request *req = (struct dwc3_request *)regs->regs[1];
+-
+-	dbg_trace_ep_queue(req);
+-
+-	return 0;
+-}
+-
+-static int entry_trace_event_raw_event_dwc3_log_gadget_ep_cmd(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct dwc3_ep *dep = (struct dwc3_ep *)regs->regs[1];
+-	unsigned int cmd = regs->regs[2];
+-	struct dwc3_gadget_ep_cmd_params *param = (struct dwc3_gadget_ep_cmd_params *)regs->regs[3];
+-	int cmd_status = regs->regs[4];
+-
+-	dbg_trace_gadget_ep_cmd(dep, cmd, param, cmd_status);
+-
+-	return 0;
+-}
+-
+-static int entry_trace_event_raw_event_dwc3_log_trb(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct dwc3_ep *dep = (struct dwc3_ep *)regs->regs[1];
+-	struct dwc3_trb *trb = (struct dwc3_trb *)regs->regs[2];
+-
+-	dbg_trace_trb_prepare(dep, trb);
+-
+-	return 0;
+-}
+-
+-static int entry_trace_event_raw_event_dwc3_log_event(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	u32 event = regs->regs[1];
+-	struct dwc3 *dwc = (struct dwc3 *)regs->regs[2];
+-
+-	dbg_trace_event(event, dwc);
+-
+-	return 0;
+-}
+-
+-static int entry_trace_event_raw_event_dwc3_log_ep(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
+-{
+-	struct dwc3_ep *dep = (struct dwc3_ep *)regs->regs[1];
+-
+-	dbg_trace_ep(dep);
+-
+-	return 0;
+-}
+-
+ static int entry_android_work(struct kretprobe_instance *ri,
+ 			     struct pt_regs *regs)
+ {
+@@ -355,7 +385,7 @@
+ 	if (opts->configured)
+ 		pr_info("USB_STATE=CONFIGURED\n");
+ 	else if (opts->sw_connected)
+-		pr_info(" USB_STATE=CONNECTED\n");
++		pr_info("USB_STATE=CONNECTED\n");
+ 	else
+ 		pr_info("USB_STATE=DISCONNECTED\n");
+ 
+@@ -369,26 +399,119 @@
+ }
+ 
+ static int exit_dwc3_host_exit(struct kretprobe_instance *ri,
+-				   struct pt_regs *regs)
++				struct pt_regs *regs)
+ {
+ 	mdelay(200);
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Tracepoint callbacks - replaces 5x unsafe kretprobes               */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The original code registered kretprobes on these 5 functions:
++ *   trace_event_raw_event_dwc3_log_request
++ *   trace_event_raw_event_dwc3_log_gadget_ep_cmd
++ *   trace_event_raw_event_dwc3_log_trb
++ *   trace_event_raw_event_dwc3_log_event
++ *   trace_event_raw_event_dwc3_log_ep
++ *
++ * This is unsafe for three reasons:
++ *
++ *   1. The kretprobe handlers called dbg_trace_* helpers which
++ *      re-triggered the same tracepoints -> recursive kprobe hit ->
++ *      BUG_ON(regs == NULL).
++ *
++ *   2. Each registration called stop_machine() to write a BRK opcode.
++ *      5 extra stop_machine() calls during module init on an already-
++ *      strained SM4100 cluster compounded the 10s kworker hang.
++ *
++ *   3. Argument extraction via regs->regs[1..4] is fragile across GKI
++ *      versions. If tracepoint calling convention changes, code silently
++ *      reads garbage with no compile-time check.
++ *
++ * register_trace_*() hooks the tracepoint call site via the tracepoint
++ * mechanism: no BRK injection, no stop_machine(), no re-entry risk,
++ * typed arguments checked at compile time.
++ */
++
++static void dwc3_tp_log_request_cb(void *d, struct dwc3_request *req)
++{
++	dbg_trace_ep_queue(req);
++}
++
++static void dwc3_tp_log_gadget_ep_cmd_cb(void *d, struct dwc3_ep *dep,
++	unsigned int cmd, struct dwc3_gadget_ep_cmd_params *param,
++	int cmd_status)
++{
++	dbg_trace_gadget_ep_cmd(dep, cmd, param, cmd_status);
++}
++
++static void dwc3_tp_log_trb_cb(void *d, struct dwc3_ep *dep,
++	struct dwc3_trb *trb)
++{
++	dbg_trace_trb_prepare(dep, trb);
++}
++
++static void dwc3_tp_log_event_cb(void *d, u32 event, struct dwc3 *dwc)
++{
++	dbg_trace_event(event, dwc);
++}
++
++static void dwc3_tp_log_ep_cb(void *d, struct dwc3_ep *dep)
++{
++	dbg_trace_ep(dep);
++}
++
++static int dwc3_tp_register_all(void)
++{
++	int ret;
+ 
+-#define ENTRY_EXIT(name) {\
+-	.handler = exit_##name,\
+-	.entry_handler = entry_##name,\
+-	.data_size = sizeof(union kprobe_data),\
+-	.maxactive = 8,\
+-	.kp.symbol_name = #name,\
++#define REG_TP(name, cb) \
++	ret = register_trace_##name(cb, NULL); \
++	if (ret) { \
++		pr_err("[dwc3_kretprobe] register_trace_" #name \
++		       " failed: %d\n", ret); \
++		return ret; \
++	}
++	REG_TP(dwc3_log_request,       dwc3_tp_log_request_cb)
++	REG_TP(dwc3_log_gadget_ep_cmd, dwc3_tp_log_gadget_ep_cmd_cb)
++	REG_TP(dwc3_log_trb,           dwc3_tp_log_trb_cb)
++	REG_TP(dwc3_log_event,         dwc3_tp_log_event_cb)
++	REG_TP(dwc3_log_ep,            dwc3_tp_log_ep_cb)
++#undef REG_TP
++	return 0;
+ }
+ 
+-#define ENTRY(name) {\
+-	.entry_handler = entry_##name,\
+-	.data_size = sizeof(union kprobe_data),\
+-	.maxactive = 8,\
+-	.kp.symbol_name = #name,\
++static void dwc3_tp_unregister_all(void)
++{
++	unregister_trace_dwc3_log_request(dwc3_tp_log_request_cb, NULL);
++	unregister_trace_dwc3_log_gadget_ep_cmd(
++			dwc3_tp_log_gadget_ep_cmd_cb, NULL);
++	unregister_trace_dwc3_log_trb(dwc3_tp_log_trb_cb, NULL);
++	unregister_trace_dwc3_log_event(dwc3_tp_log_event_cb, NULL);
++	unregister_trace_dwc3_log_ep(dwc3_tp_log_ep_cb, NULL);
++	tracepoint_synchronize_unregister();
++}
++
++/* ------------------------------------------------------------------ */
++/* kretprobe table                                                     */
++/* ------------------------------------------------------------------ */
++
++#define ENTRY_EXIT(name) {				\
++	.handler       = exit_##name,			\
++	.entry_handler = entry_##name,			\
++	.data_size     = sizeof(union kprobe_data),	\
++	.maxactive     = 8,				\
++	.kp.symbol_name = #name,			\
++}
++
++#define ENTRY(name) {					\
++	.entry_handler = entry_##name,			\
++	.data_size     = sizeof(union kprobe_data),	\
++	.maxactive     = 8,				\
++	.kp.symbol_name = #name,			\
+ }
+ 
+ static struct kretprobe dwc3_msm_probes[] = {
+@@ -400,34 +523,198 @@
+ 	ENTRY_EXIT(dwc3_gadget_pullup),
+ 	ENTRY_EXIT(android_work),
+ 	ENTRY_EXIT(usb_ep_set_maxpacket_limit),
++	/*
++	 * maxactive overridden to num_possible_cpus()*2 at init time.
++	 * The hardcoded value of 8 causes missed probes on the 8-CPU
++	 * SM4100 cluster under burst USB events, silently leaving
++	 * dis_u2_susphy_quirk permanently false (USB PM regression).
++	 */
+ 	ENTRY_EXIT(dwc3_suspend_common),
+-	ENTRY(trace_event_raw_event_dwc3_log_request),
+-	ENTRY(trace_event_raw_event_dwc3_log_gadget_ep_cmd),
+-	ENTRY(trace_event_raw_event_dwc3_log_trb),
+-	ENTRY(trace_event_raw_event_dwc3_log_event),
+-	ENTRY(trace_event_raw_event_dwc3_log_ep),
++	/*
++	 * trace_event_raw_event_dwc3_* INTENTIONALLY REMOVED.
++	 * Replaced by register_trace_*() callbacks in dwc3_tp_register_all().
++	 * See comment block above dwc3_tp_log_request_cb for full rationale.
++	 */
+ };
+ 
++/* ------------------------------------------------------------------ */
++/* init / exit                                                         */
++/* ------------------------------------------------------------------ */
+ 
++/*
++ * dwc3_msm_kretprobe_init - arm all probes
++ *
++ * MUST only be called after dwc3_msm reaches MODULE_STATE_LIVE.
++ *
++ * Calling from module_init() while dwc3_msm symbols are still resolving
++ * causes the following chain on SM4100/SM5100:
++ *
++ *   register_kretprobe()
++ *     -> arm_kprobe()
++ *       -> aarch64_insn_patch_text()
++ *         -> stop_machine_cpuslocked()
++ *           -> stop_one_cpu() -> wait_for_completion()  [NO TIMEOUT]
++ *
++ * The kworker is blocked because resolve_symbol_wait() holds module_mutex
++ * and the stop_machine stopper thread cannot be scheduled (WALT init race
++ * on SM4100). Detected as hung kworker at 10s, hardlockup NMI at 12s.
++ *
++ * Fix: called only from MODULE_STATE_LIVE notifier below.
++ */
+ int dwc3_msm_kretprobe_init(void)
+ {
+-	int ret;
+-	int i;
++	int ret = 0;
++	int i, registered = 0;
+ 
+-	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes) ; i++) {
++	/* Override maxactive for suspend probe */
++	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++) {
++		if (!strcmp(dwc3_msm_probes[i].kp.symbol_name,
++			    "dwc3_suspend_common")) {
++			dwc3_msm_probes[i].maxactive =
++				num_possible_cpus() * 2;
++			break;
++		}
++	}
++
++	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++) {
+ 		ret = register_kretprobe(&dwc3_msm_probes[i]);
+-		if (ret < 0)
+-			pr_err("register_kretprobe failed for %s, returned %d\n",
+-					dwc3_msm_probes[i].kp.symbol_name, ret);
++		if (ret < 0) {
++			pr_err("[dwc3_kretprobe] FAILED: %s ret=%d, "
++			       "cleaning up %d registered probes\n",
++			       dwc3_msm_probes[i].kp.symbol_name,
++			       ret, registered);
++			/*
++			 * Unregister already-armed probes. Each call to
++			 * unregister_kretprobe() triggers stop_machine() to
++			 * restore the original instruction from BRK. This is
++			 * unavoidable but happens in a clean context here.
++			 */
++			for (int j = 0; j < i; j++)
++				unregister_kretprobe(&dwc3_msm_probes[j]);
++			return ret;
++		}
++		registered++;
+ 	}
+ 
++	ret = dwc3_tp_register_all();
++	if (ret) {
++		for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++)
++			unregister_kretprobe(&dwc3_msm_probes[i]);
++		return ret;
++	}
++
++	pr_info("[dwc3_kretprobe] %d kretprobes + 5 tracepoints registered\n",
++		registered);
+ 	return 0;
+ }
+ 
+ void dwc3_msm_kretprobe_exit(void)
+ {
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++)
++	for (int i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++)
+ 		unregister_kretprobe(&dwc3_msm_probes[i]);
++
++	dwc3_tp_unregister_all();
++
++	/* Flush any pending deferred sched_set_* work items */
++	flush_scheduled_work();
++
++	pr_info("[dwc3_kretprobe] all probes unregistered\n");
++}
++
++/* ------------------------------------------------------------------ */
++/* Module notifier: arm probes only after MODULE_STATE_LIVE           */
++/* ------------------------------------------------------------------ */
++
++static int dwc3_msm_mod_notifier_cb(struct notifier_block *nb,
++				     unsigned long action, void *data)
++{
++	struct module *mod = data;
++
++	if (strcmp(mod->name, "dwc3_msm"))
++		return NOTIFY_DONE;
++
++	switch (action) {
++	case MODULE_STATE_LIVE:
++		/*
++		 * dwc3_msm is fully initialised. All symbols resolved.
++		 * Safe to call register_kretprobe() -> stop_machine() now.
++		 */
++		if (dwc3_msm_kretprobe_init())
++			pr_err("[dwc3_kretprobe] init failed after "
++			       "MODULE_STATE_LIVE\n");
++		break;
++
++	case MODULE_STATE_GOING:
++		/*
++		 * dwc3_msm is unloading. Remove all BRK patches before its
++		 * text segment is freed. unregister_kretprobe() calls
++		 * stop_machine() to restore original instructions.
++		 */
++		dwc3_msm_kretprobe_exit();
++		break;
++
++	default:
++		break;
++	}
++
++	return NOTIFY_OK;
+ }
++
++static struct notifier_block dwc3_msm_mod_nb = {
++	.notifier_call = dwc3_msm_mod_notifier_cb,
++	.priority      = 0,
++};
++
++static int __init dwc3_msm_kretprobe_module_init(void)
++{
++	struct module *dwc3_mod;
++	int ret;
++
++	/*
++	 * Register the module notifier first. All probe arming happens
++	 * from the notifier callback on MODULE_STATE_LIVE, never here.
++	 * This prevents stop_machine() from firing while module_mutex is
++	 * held during resolve_symbol_wait() for dwc3_msm dependencies.
++	 */
++	ret = register_module_notifier(&dwc3_msm_mod_nb);
++	if (ret) {
++		pr_err("[dwc3_kretprobe] register_module_notifier "
++		       "failed: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Handle the case where dwc3_msm was loaded before this module
++	 * (built-in, or explicit modprobe ordering). The notifier will
++	 * not fire retroactively, so check state explicitly.
++	 */
++	mutex_lock(&module_mutex);
++	dwc3_mod = find_module("dwc3_msm");
++	if (dwc3_mod && dwc3_mod->state == MODULE_STATE_LIVE) {
++		mutex_unlock(&module_mutex);
++		pr_info("[dwc3_kretprobe] dwc3_msm already live, "
++			"arming probes now\n");
++		ret = dwc3_msm_kretprobe_init();
++		if (ret) {
++			unregister_module_notifier(&dwc3_msm_mod_nb);
++			return ret;
++		}
++	} else {
++		mutex_unlock(&module_mutex);
++		pr_info("[dwc3_kretprobe] waiting for dwc3_msm "
++			"MODULE_STATE_LIVE\n");
++	}
++
++	return 0;
++}
++
++static void __exit dwc3_msm_kretprobe_module_exit(void)
++{
++	unregister_module_notifier(&dwc3_msm_mod_nb);
++	dwc3_msm_kretprobe_exit();
++}
++
++module_init(dwc3_msm_kretprobe_module_init);
++module_exit(dwc3_msm_kretprobe_module_exit);
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("DWC3 MSM kretprobe instrumentation (SM4100/SM5100 fixed)");

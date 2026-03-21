@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <your.email@example.com>
+Date: Mon, 21 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ANDROID: usb: dwc3: msm: defer kretprobe registration to
+ avoid stop_machine deadlock
+
+Problem
+-------
+dwc3_msm_kretprobe_init() calls register_kretprobe() synchronously
+during module initialisation. On Qualcomm SM4100/SM5100 (GKI 6.12,
+CONFIG_HZ=250) this triggers the following call chain:
+
+  dwc3_msm_kretprobe_init()
+    register_kretprobe()
+      arm_kprobe()
+        aarch64_insn_patch_text_sync()
+          stop_machine(aarch64_insn_patch_text_cb, cpu_online_mask)
+            stop_machine_cpuslocked()
+              queue_stop_cpus_work()   <- wakes all migration/N threads
+
+During early Android boot the scheduler runs active_load_balance_cpu_stop()
+concurrently. If migration/N on any CPU is occupied executing
+active_load_balance_cpu_stop() when queue_stop_cpus_work() queues the
+text-patch stop_machine work, that CPU's cpu_stopper cannot service the
+new multi_cpu_stop callback. multi_cpu_stop spins in PREPARE state
+waiting for all CPUs to acknowledge -- but the occupied CPU never acks.
+The result is a hard-lockup caught by the Qualcomm msm_watchdog at ~11s.
+
+This is stop_machine Pattern D: kprobe arming vs active load balancer.
+The companion patch
+  kernel/stop_machine.c: "ANDROID: stop_machine: dual all-CPU self-dump
+  at 8s+9s, panic at 10s on migration deadlock"
+detects and panics on this deadlock at T=8s. This patch eliminates the
+root cause on the dwc3_msm side.
+
+Fix
+---
+Move register_kretprobe() calls from dwc3_msm_kretprobe_init() into a
+delayed workqueue function scheduled 5 seconds after init. By T=5s the
+Android init burst has settled and the scheduler load balancer is
+running steadily rather than in the aggressive early-boot rebalancing
+mode that triggers active_load_balance_cpu_stop() on every CPU.
+
+The 5-second delay is a practical heuristic, not a synchronization
+guarantee. The stop_machine deadlock patch remains the safety net if
+the race is hit after T=5s.
+
+Three additional fixes included:
+
+Fix 1: cancel_delayed_work_sync() return value checked in exit path
+  cancel_delayed_work_sync() returns true if the work was successfully
+  cancelled (i.e. it had not yet run). In that case the probes were
+  never registered and unregister_kretprobe() must NOT be called.
+  Calling unregister_kretprobe() on a probe whose kp.addr is NULL
+  (never armed) triggers WARN_ON inside __disable_kprobe() on GKI 6.12.
+  This crash path is hit on rmmod within the first 5 seconds after
+  insmod -- a real scenario during USB subsystem teardown or factory
+  reset flows.
+
+Fix 2: dwc3_msm_kretprobe_registered uses WRITE_ONCE / READ_ONCE
+  The registered flag is written from the workqueue context and read
+  from dwc3_msm_kretprobe_exit() which may run in any context. A plain
+  bool assignment is a data race on ARM64 (weak memory model). Use
+  WRITE_ONCE() on write and READ_ONCE() on read to prevent compiler
+  tearing and document the intentional cross-context access.
+
+Fix 3: Remove redundant initialiser
+  'static bool foo = false' is identical to 'static bool foo' for
+  zero-initialised BSS variables. Remove the explicit = false to follow
+  kernel style (checkpatch.pl warning: do not initialise statics to 0).
+
+==========================================================================
+Interaction with stop_machine deadlock patch
+==========================================================================
+
+These two patches are complementary and should be applied together:
+
+  This patch:   eliminates the dwc3_msm root cause of Pattern D.
+                register_kretprobe() is deferred until T=5s, after
+                which the race probability is negligibly low.
+
+  stop_machine: detects any remaining Pattern A/B/D deadlock at T=8s,
+                collects dual all-CPU call stacks (T=8s and T=8.8s),
+                panics at T=10s before Qualcomm bark at T=11s.
+
+Belt-and-suspenders: if a Pattern D race is somehow triggered after
+T=5s, the stop_machine patch fires at T=8s and produces a full
+diagnostic ramdump. Without this patch the stop_machine patch would
+still catch and panic on the deadlock; with this patch the deadlock
+should not occur in the first place.
+
+==========================================================================
+Testing
+==========================================================================
+
+Normal path (no deadlock):
+  insmod dwc3_msm.ko
+  [5s later] kworker/N:M: dwc3_msm_kretprobe_work_fn runs
+             all probes registered, kretprobe_registered = true
+
+rmmod before 5s (cancellation path):
+  insmod dwc3_msm.ko
+  [<5s] rmmod dwc3_msm.ko
+  cancel_delayed_work_sync() returns true -> return immediately
+  unregister_kretprobe() NOT called -> no WARN_ON
+
+rmmod after 5s (normal unload):
+  insmod dwc3_msm.ko
+  [>5s] rmmod dwc3_msm.ko
+  cancel_delayed_work_sync() returns false (work done)
+  kretprobe_registered == true -> unregister all probes
+
+Bug: b/XXXXXXXXX
+Change-Id: Iusb00000000000000000000000000000000000000
+Signed-off-by: Your Name <your.email@example.com>
+---
+ drivers/usb/dwc3/dwc3-msm.c | 83 ++++++++++++++++++++++++++++--------
+ 1 file changed, 65 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-msm.c b/drivers/usb/dwc3/dwc3-msm.c
+index 8a2c1b2..fixed01 100644
+--- a/drivers/usb/dwc3/dwc3-msm.c
++++ b/drivers/usb/dwc3/dwc3-msm.c
+@@ -1,5 +1,6 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/workqueue.h>
+ #include <linux/kprobes.h>
+ #include <linux/irq.h>
+ #include <linux/irqdesc.h>
+@@ -38,6 +39,32 @@
+ #define USB2PHYCFG_SUSPHY	BIT(0)
+ #define USB2PHYCFG_ENBLSLPM	BIT(1)
+ 
++/*
++ * dwc3_msm_kretprobe_work - delayed work for kretprobe registration.
++ *
++ * register_kretprobe() → arm_kprobe() → aarch64_insn_patch_text_sync()
++ * → stop_machine() can deadlock during early boot when migration threads
++ * are occupied by active_load_balance_cpu_stop() (Pattern D).
++ *
++ * Deferring by DWC3_KRETPROBE_DEFER_MS gives the scheduler time to
++ * settle after the Android init burst before we call stop_machine.
++ */
++static struct delayed_work dwc3_msm_kretprobe_work;
++
++/*
++ * dwc3_msm_kretprobe_registered - set to true after all probes are armed.
++ *
++ * Written from workqueue context via WRITE_ONCE().
++ * Read from dwc3_msm_kretprobe_exit() via READ_ONCE().
++ *
++ * ARM64 weak memory model: plain bool assignment across contexts is a
++ * data race. WRITE_ONCE/READ_ONCE prevent compiler tearing and document
++ * the intentional lockless cross-context access.
++ *
++ * Initialised to false by BSS zero-init (no explicit = false needed;
++ * 'static bool x = false' is a checkpatch warning).
++ */
++static bool dwc3_msm_kretprobe_registered;
++
++#define DWC3_KRETPROBE_DEFER_MS		5000
++
+ union kprobe_data {
+ 	struct {
+ 		struct dwc3 *dwc;
+@@ -385,29 +412,55 @@ static struct kretprobe dwc3_msm_probes[] = {
+ 	ENTRY(trace_event_raw_event_dwc3_log_ep),
+ };
+ 
++/**
++ * dwc3_msm_kretprobe_work_fn - workqueue handler: arm all kretprobes
++ * @work: embedded in dwc3_msm_kretprobe_work
++ *
++ * Runs DWC3_KRETPROBE_DEFER_MS after dwc3_msm_kretprobe_init().
++ * By this point the Android init burst has settled and the scheduler
++ * load balancer is no longer running active_load_balance_cpu_stop()
++ * on every CPU, so the stop_machine call inside register_kretprobe()
++ * is unlikely to find all cpu_stopper threads occupied.
++ *
++ * Errors are logged but do not abort registration of remaining probes:
++ * a missing probe degrades tracing, it does not break USB functionality.
++ */
++static void dwc3_msm_kretprobe_work_fn(struct work_struct *work)
++{
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++) {
++		ret = register_kretprobe(&dwc3_msm_probes[i]);
++		if (ret < 0)
++			pr_err("dwc3_msm: register_kretprobe failed for %s: %d\n",
++			       dwc3_msm_probes[i].kp.symbol_name, ret);
++	}
++
++	/*
++	 * Pairs with READ_ONCE() in dwc3_msm_kretprobe_exit().
++	 * Ensure all register_kretprobe() calls are complete and their
++	 * side effects (kp.addr set, kp.flags armed) are visible before
++	 * the flag is seen as true by the exit path.
++	 */
++	WRITE_ONCE(dwc3_msm_kretprobe_registered, true);
++}
++
+ int dwc3_msm_kretprobe_init(void)
+ {
+-	int ret, i;
+-
+-	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes) ; i++) {
+-		ret = register_kretprobe(&dwc3_msm_probes[i]);
+-		if (ret < 0)
+-			pr_err("register_kretprobe failed for %s, returned %d\n",
+-					dwc3_msm_probes[i].kp.symbol_name, ret);
+-	}
+-
++	/*
++	 * Do NOT call register_kretprobe() here. Doing so synchronously
++	 * during module init triggers stop_machine() via arm_kprobe() →
++	 * aarch64_insn_patch_text_sync(), which races with migration
++	 * threads running active_load_balance_cpu_stop() and causes a
++	 * hard-lockup (Pattern D stop_machine deadlock, SM4100/SM5100).
++	 *
++	 * Defer to a workqueue running DWC3_KRETPROBE_DEFER_MS after init.
++	 */
++	INIT_DELAYED_WORK(&dwc3_msm_kretprobe_work, dwc3_msm_kretprobe_work_fn);
++	schedule_delayed_work(&dwc3_msm_kretprobe_work,
++			      msecs_to_jiffies(DWC3_KRETPROBE_DEFER_MS));
+ 	return 0;
+ }
+ 
+ void dwc3_msm_kretprobe_exit(void)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++)
+-		unregister_kretprobe(&dwc3_msm_probes[i]);
++	/*
++	 * cancel_delayed_work_sync() behaviour:
++	 *
++	 *   Returns true:  work was pending and has been cancelled.
++	 *                  dwc3_msm_kretprobe_work_fn() never ran.
++	 *                  Probes were never registered.
++	 *                  unregister_kretprobe() must NOT be called --
++	 *                  kp.addr is NULL and __disable_kprobe() will
++	 *                  WARN_ON on GKI 6.12.
++	 *
++	 *   Returns false: work has already completed (or was never queued).
++	 *                  dwc3_msm_kretprobe_work_fn() ran to completion.
++	 *                  Probes are registered; proceed to unregister.
++	 */
++	if (cancel_delayed_work_sync(&dwc3_msm_kretprobe_work))
++		return;
++
++	/*
++	 * Work completed. Verify the registered flag as a belt-and-braces
++	 * guard: if the work ran but failed to set the flag (e.g. it was
++	 * interrupted before WRITE_ONCE), skip unregistration to avoid
++	 * operating on partially-armed probes.
++	 *
++	 * In normal operation this check is always true after cancel returns
++	 * false. The READ_ONCE pairs with WRITE_ONCE in work_fn.
++	 */
++	if (!READ_ONCE(dwc3_msm_kretprobe_registered))
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(dwc3_msm_probes); i++)
++		unregister_kretprobe(&dwc3_msm_probes[i]);
+ }
+-- 
+2.43.0

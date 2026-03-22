@@ -137,3 +137,68 @@ clang-19 -S -emit-llvm -O2 -target aarch64-linux-gnu \
   -fsanitize=kernel-address test.c -o - | \
   grep 'frame-pointer'
 ```
+```
+$ grep -B1 'str.*x30\|stp.*x29.*x30' no_kasan.s
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+        .cfi_def_cfa_offset 32
+        stp     x29, x30, [sp, #16]             // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+        .cfi_def_cfa_offset 48
+        stp     x29, x30, [sp, #16]             // 16-byte Folded Spill
+$ grep -B1 'str.*x30\|stp.*x29.*x30' with_kasan.s
+// %bb.0:                               // %entry
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:                               // %entry
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:                               // %entry
+        stp     x29, x30, [sp, #-32]!           // 16-byte Folded Spill
+--
+// %bb.0:                               // %entry
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+        .cfi_def_cfa_offset 32
+        stp     x29, x30, [sp, #16]             // 16-byte Folded Spill
+--
+// %bb.0:                               // %entry
+        stp     x29, x30, [sp, #-48]!           // 16-byte Folded Spill
+--
+        .cfi_def_cfa_offset 48
+        stp     x29, x30, [sp, #16]             // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+--
+// %bb.0:
+        stp     x29, x30, [sp, #-16]!           // 16-byte Folded Spill
+
+```
+
+```
+attributes #0 = { mustprogress nofree noinline norecurse nosync nounwind sanitize_address willreturn memory(none) uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #2 = { nofree noinline norecurse nounwind sanitize_address memory(readwrite, argmem: none) uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #3 = { noinline nounwind sanitize_address uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #4 = { "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #5 = { mustprogress nofree noinline norecurse nosync nounwind sanitize_address willreturn memory(argmem: readwrite) uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #6 = { mustprogress nofree noinline norecurse nosync nounwind sanitize_address willreturn memory(argmem: read) uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #7 = { nofree noinline norecurse nosync nounwind sanitize_address memory(none) uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #8 = { nounwind sanitize_address uwtable "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+attributes #9 = { nounwind uwtable "frame-pointer"="all" "target-cpu"="generic" "target-features"="+fp-armv8,+neon,+outline-atomics,+v8a,-fmv" }
+!4 = !{i32 7, !"frame-pointer", i32 2}
+
+```

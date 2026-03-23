@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// Panic handler required for `no_std` crates.
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop {}
 }
 
@@ -376,4 +376,4 @@ pub extern "C" fn force_emit_all() -> isize {
     r = r.wrapping_add(unsafe { is_ashmem_file(null_mut()) } as isize);
 
     r
-            }
+}

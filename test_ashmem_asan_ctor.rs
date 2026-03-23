@@ -376,4 +376,4 @@ pub extern "C" fn force_emit_all() -> isize {
     r = r.wrapping_add(unsafe { is_ashmem_file(null_mut()) } as isize);
 
     r
-}
+        }

@@ -1,4 +1,4 @@
-    //! Standalone reproducer for `asan.module_ctor` frame pointer issue.
+//! Standalone reproducer for `asan.module_ctor` frame pointer issue.
 //!
 //! Mirrors the exact global statics from `drivers/staging/android/ashmem.rs`
 //! (`android16-6.12`) that trigger LLVM `asan.module_ctor` generation under
@@ -376,4 +376,4 @@ pub extern "C" fn force_emit_all() -> isize {
     r = r.wrapping_add(unsafe { is_ashmem_file(null_mut()) } as isize);
 
     r
-                    }
+            }

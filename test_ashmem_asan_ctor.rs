@@ -1,526 +1,379 @@
-rustc  : rustc 1.82.0-dev (f6e511eec 2024-10-15) (Android Rust Toolchain version linux-12909517)
-objdump: llvm-objdump
-source : ./test_ashmem_asan_ctor.rs
+    //! Standalone reproducer for `asan.module_ctor` frame pointer issue.
+//!
+//! Mirrors the exact global statics from `drivers/staging/android/ashmem.rs`
+//! (`android16-6.12`) that trigger LLVM `asan.module_ctor` generation under
+//! `CONFIG_KASAN_GENERIC=y`.
+//!
+//! # Build
+//!
+//! Use the companion `build_ashmem_test.sh` script, or manually:
+//!
+//! ```text
+//! rustc --edition=2021 --crate-type=lib \
+//!   -Zbinary_dep_depinfo=y -Astable_features \
+//!   -Dnon_ascii_idents -Dunsafe_op_in_unsafe_fn \
+//!   -Wmissing_docs -Wrust_2018_idioms -Wunreachable_pub \
+//!   -Wclippy::all -Wclippy::ignored_unit_patterns \
+//!   -Wclippy::mut_mut -Wclippy::needless_bitwise_bool \
+//!   -Aclippy::needless_lifetimes \
+//!   -Wclippy::no_mangle_with_rust_abi \
+//!   -Wclippy::undocumented_unsafe_blocks \
+//!   -Wclippy::unnecessary_safety_comment \
+//!   -Wclippy::unnecessary_safety_doc \
+//!   -Wrustdoc::missing_crate_level_docs \
+//!   -Wrustdoc::unescaped_backticks \
+//!   -Cpanic=abort -Cembed-bitcode=n -Clto=n \
+//!   -Cforce-unwind-tables=n -Ccodegen-units=1 \
+//!   -Csymbol-mangling-version=v0 -Crelocation-model=static \
+//!   -Zfunction-sections=n -Wclippy::float_arithmetic \
+//!   --target=aarch64-unknown-none \
+//!   -Ctarget-feature="-neon" \
+//!   -Cforce-unwind-tables=y -Zuse-sync-unwind=n \
+//!   -Zbranch-protection=pac-ret -Zfixed-x18 \
+//!   -Cforce-frame-pointers=yes \
+//!   -Zsanitizer=kernel-address \
+//!   -o kasan_fp.o --emit=obj test_ashmem_asan_ctor.rs
+//! ```
 
-═══════════════════════════════════════════════════════════
-  Build 1: BASELINE — no KASAN, with -Cforce-frame-pointers=yes
-═══════════════════════════════════════════════════════════
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:54
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    = note: `#[warn(improper_ctypes_definitions)]` on by default
+// Suppress all lints enabled by KBUILD_RUSTFLAGS that do not apply
+// to a standalone test file outside the kernel tree.
+#![no_std]
+#![allow(missing_docs)]
+#![allow(clippy::undocumented_unsafe_blocks)]
+#![allow(clippy::unnecessary_safety_comment)]
+#![allow(clippy::unnecessary_safety_doc)]
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:74
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+use core::cell::UnsafeCell;
+use core::pin::Pin;
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-warning: `extern` fn uses type `UserSliceWriter`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:54
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:130:1
-    |
-130 | pub struct UserSliceWriter {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/// Panic handler required for `no_std` crates.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:74
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── Exact statics from ashmem.rs:73-76 ─────────────────────
+// These are what trigger `asan.module_ctor` generation: LLVM's
+// AddressSanitizer pass must register each global with the KASAN
+// shadow memory by synthesising a module constructor.
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:251:62
-    |
-251 |     extern "C" fn set_size(self: Pin<&Self>, size: usize) -> Result<isize> {
-    |                                                              ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+static NUM_PIN_IOCTLS_WAITING: AtomicUsize = AtomicUsize::new(0);
+static IGNORE_UNSET_PROT_READ: AtomicBool = AtomicBool::new(false);
+static IGNORE_UNSET_PROT_EXEC: AtomicBool = AtomicBool::new(false);
+static ASHMEM_FOPS_PTR: AtomicPtr<u8> = AtomicPtr::new(null_mut());
+static LRU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:266:49
-    |
-266 |     extern "C" fn get_size(self: Pin<&Self>) -> Result<isize> {
-    |                                                 ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── Constants matching ashmem.rs ────────────────────────────
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:274:71
-    |
-274 |     extern "C" fn set_prot_mask(self: Pin<&Self>, mut prot: usize) -> Result<isize> {
-    |                                                                       ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+const ASHMEM_NAME_LEN: usize = 256;
+const ASHMEM_NAME_PREFIX_LEN: usize = 11;
+const ASHMEM_FULL_NAME_LEN: usize = ASHMEM_NAME_LEN + ASHMEM_NAME_PREFIX_LEN;
+const ASHMEM_NAME_PREFIX: [u8; ASHMEM_NAME_PREFIX_LEN] = *b"dev/ashmem/";
+const ASHMEM_MAX_SIZE: usize = usize::MAX >> 1;
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:296:54
-    |
-296 |     extern "C" fn get_prot_mask(self: Pin<&Self>) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+const PROT_READ: usize = 0x1;
+const PROT_WRITE: usize = 0x2;
+const PROT_EXEC: usize = 0x4;
+const PROT_MASK: usize = PROT_EXEC | PROT_READ | PROT_WRITE;
 
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:65
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                 ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+type Result<T> = core::result::Result<T, i32>;
+const EINVAL: i32 = -22;
+const ENOTTY: i32 = -25;
+const EPERM: i32 = -1;
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:85
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                                     ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── Simulated kernel uaccess ────────────────────────────────
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:331:66
-    |
-331 |     extern "C" fn ioctl(me: Pin<&Self>, cmd: u32, arg: usize) -> Result<isize> {
-    |                                                                  ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+struct UserSliceReader {
+    addr: usize,
+    remaining: usize,
+}
 
-warning: 11 warnings emitted
+struct UserSliceWriter {
+    addr: usize,
+    remaining: usize,
+}
 
-  OK → /tmp/tmp.P6Y454sP82/baseline.o
+impl UserSliceReader {
+    #[inline(never)]
+    fn read_all(self, buf: &mut [u8]) -> Result<()> {
+        let len = core::cmp::min(self.remaining, buf.len());
+        let mut i = 0;
+        while i < len {
+            buf[i] = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
+            i += 1;
+        }
+        Ok(())
+    }
+}
 
-═══════════════════════════════════════════════════════════
-  Build 2: KASAN + -Cforce-frame-pointers=yes (proposed fix)
-═══════════════════════════════════════════════════════════
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:54
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    = note: `#[warn(improper_ctypes_definitions)]` on by default
+impl UserSliceWriter {
+    #[inline(never)]
+    fn write_all(self, buf: &[u8]) -> Result<()> {
+        let len = core::cmp::min(self.remaining, buf.len());
+        let mut i = 0;
+        while i < len {
+            unsafe { core::ptr::write_volatile((self.addr + i) as *mut u8, buf[i]) };
+            i += 1;
+        }
+        Ok(())
+    }
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:74
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+fn user_slice_reader(addr: usize, len: usize) -> UserSliceReader {
+    UserSliceReader { addr, remaining: len }
+}
 
-warning: `extern` fn uses type `UserSliceWriter`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:54
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:130:1
-    |
-130 | pub struct UserSliceWriter {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+fn user_slice_writer(addr: usize, len: usize) -> UserSliceWriter {
+    UserSliceWriter { addr, remaining: len }
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:74
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+fn ioc_size(cmd: u32) -> usize {
+    ((cmd >> 16) & 0x3FFF) as usize
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:251:62
-    |
-251 |     extern "C" fn set_size(self: Pin<&Self>, size: usize) -> Result<isize> {
-    |                                                              ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── AshmemInner ─────────────────────────────────────────────
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:266:49
-    |
-266 |     extern "C" fn get_size(self: Pin<&Self>) -> Result<isize> {
-    |                                                 ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+struct AshmemInner {
+    size: usize,
+    prot_mask: usize,
+    name: Option<[u8; ASHMEM_NAME_LEN]>,
+    name_len: usize,
+    mapped: bool,
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:274:71
-    |
-274 |     extern "C" fn set_prot_mask(self: Pin<&Self>, mut prot: usize) -> Result<isize> {
-    |                                                                       ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── Ashmem ──────────────────────────────────────────────────
+// Real ashmem.rs uses `Mutex<AshmemInner>` which wraps UnsafeCell
+// internally. We use UnsafeCell directly for the standalone build.
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:296:54
-    |
-296 |     extern "C" fn get_prot_mask(self: Pin<&Self>) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+struct Ashmem {
+    inner: UnsafeCell<AshmemInner>,
+}
 
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:65
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                 ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+unsafe impl Sync for Ashmem {}
+unsafe impl Send for Ashmem {}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:85
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                                     ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+impl Ashmem {
+    #[inline(always)]
+    unsafe fn lock(&self) -> &mut AshmemInner {
+        unsafe { &mut *self.inner.get() }
+    }
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:331:66
-    |
-331 |     extern "C" fn ioctl(me: Pin<&Self>, cmd: u32, arg: usize) -> Result<isize> {
-    |                                                                  ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+    // ── ashmem.rs:300 — set_name ──
+    #[inline(never)]
+    fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        if inner.mapped {
+            return Err(EINVAL);
+        }
+        let mut name = [0u8; ASHMEM_NAME_LEN];
+        let len = core::cmp::min(reader.remaining, ASHMEM_NAME_LEN - 1);
+        let r = UserSliceReader { addr: reader.addr, remaining: len };
+        r.read_all(&mut name[..len])?;
+        name[len] = 0;
+        inner.name = Some(name);
+        inner.name_len = len;
+        Ok(0)
+    }
 
-warning: 11 warnings emitted
+    // ── ashmem.rs:315 — get_name ──
+    #[inline(never)]
+    fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        match inner.name {
+            Some(ref name) => {
+                let mut full_name = [0u8; ASHMEM_FULL_NAME_LEN];
+                full_name[..ASHMEM_NAME_PREFIX_LEN].copy_from_slice(&ASHMEM_NAME_PREFIX);
+                let copy_len = core::cmp::min(inner.name_len, ASHMEM_NAME_LEN);
+                full_name[ASHMEM_NAME_PREFIX_LEN..ASHMEM_NAME_PREFIX_LEN + copy_len]
+                    .copy_from_slice(&name[..copy_len]);
+                writer.write_all(&full_name[..ASHMEM_NAME_PREFIX_LEN + copy_len])?;
+                Ok(0)
+            }
+            None => {
+                writer.write_all(b"dev/ashmem/")?;
+                Ok(0)
+            }
+        }
+    }
 
-  OK → /tmp/tmp.P6Y454sP82/kasan_fp.o
+    // ── ashmem.rs:334 — set_size ──
+    #[inline(never)]
+    fn set_size(self: Pin<&Self>, size: usize) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        if inner.mapped {
+            return Err(EINVAL);
+        }
+        if size == 0 || size >= ASHMEM_MAX_SIZE {
+            return Err(EINVAL);
+        }
+        inner.size = size;
+        Ok(0)
+    }
 
-═══════════════════════════════════════════════════════════
-  Build 3: KASAN WITHOUT -Cforce-frame-pointers (current broken)
-═══════════════════════════════════════════════════════════
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:54
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    = note: `#[warn(improper_ctypes_definitions)]` on by default
+    // ── ashmem.rs:343 — get_size ──
+    #[inline(never)]
+    fn get_size(self: Pin<&Self>) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        Ok(inner.size as isize)
+    }
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:208:74
-    |
-208 |     extern "C" fn set_name(self: Pin<&Self>, reader: UserSliceReader) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+    // ── ashmem.rs:347 — set_prot_mask (reads module statics) ──
+    #[inline(never)]
+    fn set_prot_mask(self: Pin<&Self>, mut prot: usize) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        if IGNORE_UNSET_PROT_READ.load(Ordering::Relaxed) {
+            prot |= PROT_READ;
+        }
+        if IGNORE_UNSET_PROT_EXEC.load(Ordering::Relaxed) {
+            prot |= PROT_EXEC;
+        }
+        if prot & !PROT_MASK != 0 {
+            return Err(EINVAL);
+        }
+        if prot & !inner.prot_mask != 0 {
+            return Err(EINVAL);
+        }
+        inner.prot_mask = prot;
+        Ok(0)
+    }
 
-warning: `extern` fn uses type `UserSliceWriter`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:54
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:130:1
-    |
-130 | pub struct UserSliceWriter {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    // ── ashmem.rs:373 — get_prot_mask ──
+    #[inline(never)]
+    fn get_prot_mask(self: Pin<&Self>) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        Ok(inner.prot_mask as isize)
+    }
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:229:74
-    |
-229 |     extern "C" fn get_name(self: Pin<&Self>, writer: UserSliceWriter) -> Result<isize> {
-    |                                                                          ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+    // ── ashmem.rs:389 — pin_unpin (accesses NUM_PIN_IOCTLS_WAITING) ──
+    #[inline(never)]
+    fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
+        let inner = unsafe { self.lock() };
+        if inner.size == 0 {
+            return Err(EINVAL);
+        }
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:251:62
-    |
-251 |     extern "C" fn set_size(self: Pin<&Self>, size: usize) -> Result<isize> {
-    |                                                              ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+        NUM_PIN_IOCTLS_WAITING.fetch_add(1, Ordering::Relaxed);
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:266:49
-    |
-266 |     extern "C" fn get_size(self: Pin<&Self>) -> Result<isize> {
-    |                                                 ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+        let mut pin_buf = [0u8; 8];
+        reader.read_all(&mut pin_buf)?;
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:274:71
-    |
-274 |     extern "C" fn set_prot_mask(self: Pin<&Self>, mut prot: usize) -> Result<isize> {
-    |                                                                       ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+        let _offset = u32::from_ne_bytes([pin_buf[0], pin_buf[1], pin_buf[2], pin_buf[3]]);
+        let _len = u32::from_ne_bytes([pin_buf[4], pin_buf[5], pin_buf[6], pin_buf[7]]);
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:296:54
-    |
-296 |     extern "C" fn get_prot_mask(self: Pin<&Self>) -> Result<isize> {
-    |                                                      ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+        NUM_PIN_IOCTLS_WAITING.fetch_sub(1, Ordering::Relaxed);
 
-warning: `extern` fn uses type `UserSliceReader`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:65
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                 ^^^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
-    = note: this struct has unspecified layout
-note: the type is defined here
-   --> ./test_ashmem_asan_ctor.rs:125:1
-    |
-125 | pub struct UserSliceReader {
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+        match cmd {
+            0x4008_7707 => Ok(0),
+            0x4008_7708 => Ok(0),
+            0x0000_7709 => Ok(0),
+            _ => Err(EINVAL),
+        }
+    }
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:304:85
-    |
-304 |     extern "C" fn pin_unpin(self: Pin<&Self>, cmd: u32, reader: UserSliceReader) -> Result<isize> {
-    |                                                                                     ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+    // ── ashmem.rs:257 — main ioctl dispatch ──
+    #[inline(never)]
+    fn ioctl(me: Pin<&Self>, cmd: u32, arg: usize) -> Result<isize> {
+        let size = ioc_size(cmd);
+        match cmd {
+            0x4100_7701 => me.set_name(user_slice_reader(arg, size)),
+            0x8100_7702 => me.get_name(user_slice_writer(arg, size)),
+            0x4008_7703 => me.set_size(arg),
+            0x0000_7704 => me.get_size(),
+            0x4004_7705 => me.set_prot_mask(arg),
+            0x0000_7706 => me.get_prot_mask(),
+            0x4008_7707 | 0x4008_7708 | 0x0000_7709 => {
+                me.pin_unpin(cmd, user_slice_reader(arg, size))
+            }
+            0x0000_770A => Err(EPERM),
+            _ => Err(ENOTTY),
+        }
+    }
+}
 
-warning: `extern` fn uses type `core::result::Result<isize, i32>`, which is not FFI-safe
-   --> ./test_ashmem_asan_ctor.rs:331:66
-    |
-331 |     extern "C" fn ioctl(me: Pin<&Self>, cmd: u32, arg: usize) -> Result<isize> {
-    |                                                                  ^^^^^^^^^^^^^ not FFI-safe
-    |
-    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
-    = note: enum has no representation hint
+// ─── Free functions matching ashmem.rs ───────────────────────
 
-warning: 11 warnings emitted
+#[inline(never)]
+fn shrinker_should_stop() -> bool {
+    NUM_PIN_IOCTLS_WAITING.load(Ordering::Relaxed) > 0
+}
 
-  OK → /tmp/tmp.P6Y454sP82/kasan_nofp.o
+/// FFI export — mirrors `ashmem.rs:506`.
+#[no_mangle]
+pub unsafe extern "C" fn is_ashmem_file(file: *mut u8) -> bool {
+    let fops_ptr = ASHMEM_FOPS_PTR.load(Ordering::Relaxed);
+    if file.is_null() || fops_ptr.is_null() {
+        return false;
+    }
+    file == fops_ptr
+}
 
+#[inline(never)]
+fn shrink_count() -> usize {
+    LRU_COUNT.load(Ordering::Relaxed)
+}
 
-═══════════════════════════════════════════════════════════
-  BASELINE — no KASAN, with frame pointers
-═══════════════════════════════════════════════════════════
+#[inline(never)]
+fn shrink_scan(nr: usize) -> usize {
+    if shrinker_should_stop() {
+        return 0;
+    }
+    let count = LRU_COUNT.load(Ordering::Relaxed);
+    let scanned = core::cmp::min(nr, count);
+    LRU_COUNT.fetch_sub(scanned, Ordering::Relaxed);
+    scanned
+}
 
-  Total functions          : 56
-  paciasp (PAC-RET)        : 0
-  stp x29, x30 (GOOD)     : 56
-  str x30       (BAD)     : 0
-  asan.module_ctor present : NO
+// ─── Entry point — forces all statics and functions live ─────
 
-═══════════════════════════════════════════════════════════
-  KASAN WITHOUT -Cforce-frame-pointers (current build)
-═══════════════════════════════════════════════════════════
+/// FFI export — ensures all globals are reachable so KASAN
+/// synthesises `asan.module_ctor` to register them.
+#[no_mangle]
+pub extern "C" fn force_emit_all() -> isize {
+    let ashmem = Ashmem {
+        inner: UnsafeCell::new(AshmemInner {
+            size: 0,
+            prot_mask: PROT_MASK,
+            name: None,
+            name_len: 0,
+            mapped: false,
+        }),
+    };
 
-  Total functions          : 58
-  paciasp (PAC-RET)        : 0
-  stp x29, x30 (GOOD)     : 12
-  str x30       (BAD)     : 39
-  asan.module_ctor present : YES
+    let pinned = unsafe { Pin::new_unchecked(&ashmem) };
+    let mut r: isize = 0;
 
-  *** str x30 sites: ***
-    0000000000000000 <_RINvNtCsgc5Frn9pZ9V_4core3cmp3minjECsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-             4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    00000000000001bc <_RINvNtCsgc5Frn9pZ9V_4core3ptr13read_volatilehECsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-           1c4: fe 13 00 f9  	str	x30, [sp, #32]
-    0000000000000254 <_RINvNtCsgc5Frn9pZ9V_4core3ptr14write_volatilehECsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-           25c: fe 13 00 f9  	str	x30, [sp, #32]
-    00000000000011b4 <_RNvMs1e_NtNtCsgc5Frn9pZ9V_4core4sync6atomicNtB6_11AtomicUsize4loadCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          11b8: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    00000000000011cc <_RNvMs1e_NtNtCsgc5Frn9pZ9V_4core4sync6atomicNtB6_11AtomicUsize9fetch_addCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          11d4: fe 53 00 f9  	str	x30, [sp, #160]
-    00000000000014e8 <_RNvMs1e_NtNtCsgc5Frn9pZ9V_4core4sync6atomicNtB6_11AtomicUsize9fetch_subCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          14f0: fe 53 00 f9  	str	x30, [sp, #160]
-    0000000000001804 <_RNvMs3_NtNtCsgc5Frn9pZ9V_4core4sync6atomicNtB5_10AtomicBool4loadCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1808: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000001824 <_RNvMs4_NtNtCsgc5Frn9pZ9V_4core4sync6atomicINtB5_9AtomicPtrhE4loadCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1828: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    000000000000183c <_RNvMs4_NtNtCsgc5Frn9pZ9V_4core4sync6atomicINtB5_9AtomicPtrhE5storeCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1840: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000001854 <_RNvMs6_NtCsgc5Frn9pZ9V_4core3numm13from_ne_bytesCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          185c: fe 0b 00 f9  	str	x30, [sp, #16]
-    00000000000018a8 <_RNvNvMs9_NtCsgc5Frn9pZ9V_4core3numj13unchecked_add18precondition_checkCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          18ac: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000001d64 <_RNvXNtNtCsgc5Frn9pZ9V_4core3ops5derefRNtCsd8Bjm28kwoH_21test_ashmem_asan_ctor6AshmemNtB2_5Deref5derefBC_>:
-          1d6c: fe 0b 00 f9  	str	x30, [sp, #16]
-    0000000000001db4 <_RNvXs2_NtNtCsgc5Frn9pZ9V_4core5slice5indexINtNtNtB9_3ops5range5RangejEINtB5_10SliceIndexShE9index_mutCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1dbc: fe 23 00 f9  	str	x30, [sp, #64]
-    0000000000001e58 <_RNvXs3_NtNtCsgc5Frn9pZ9V_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1e60: fe 33 00 f9  	str	x30, [sp, #96]
-    0000000000001fa4 <_RNvXs4_NtNtCsgc5Frn9pZ9V_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1fa8: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000001fbc <_RNvXs4_NtNtCsgc5Frn9pZ9V_4core5slice5indexINtNtNtB9_3ops5range7RangeTojEINtB5_10SliceIndexShE9index_mutCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1fc0: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000001fe8 <_RNvXsF_NtNtCsgc5Frn9pZ9V_4core4iter5rangejNtB5_4Step17forward_uncheckedCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          1ff0: fe 0b 00 f9  	str	x30, [sp, #16]
-    000000000000202c <_RNvXsV_NtNtCsgc5Frn9pZ9V_4core3cmp5implsjNtB7_3Ord3cmpCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          2034: fe 1b 00 f9  	str	x30, [sp, #48]
-    00000000000020d0 <_RNvXsb_NtCsgc5Frn9pZ9V_4core3pinINtB5_3PinRNtCsd8Bjm28kwoH_21test_ashmem_asan_ctor6AshmemENtNtNtB7_3ops5deref5Deref5derefBH_>:
-          20d4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    00000000000020e8 <_RNvXsd_NtCsgc5Frn9pZ9V_4core5arrayAhj100_INtNtNtB7_3ops5index5IndexINtNtBI_5range7RangeTojEE5indexCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          20f0: fe 1b 00 f9  	str	x30, [sp, #48]
-    0000000000002150 <_RNvXsd_NtCsgc5Frn9pZ9V_4core5arrayAhj10b_INtNtNtB7_3ops5index5IndexINtNtBI_5range7RangeTojEE5indexCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          2158: fe 1b 00 f9  	str	x30, [sp, #48]
-    00000000000021b8 <_RNvXse_NtCsgc5Frn9pZ9V_4core5arrayAhj100_INtNtNtB7_3ops5index8IndexMutINtNtBI_5range7RangeTojEE9index_mutCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          21c0: fe 0b 00 f9  	str	x30, [sp, #16]
-    00000000000021f0 <_RNvXse_NtCsgc5Frn9pZ9V_4core5arrayAhj10b_INtNtNtB7_3ops5index8IndexMutINtNtBI_5range5RangejEE9index_mutCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          21f8: fe 0b 00 f9  	str	x30, [sp, #16]
-    0000000000002234 <_RNvXse_NtCsgc5Frn9pZ9V_4core5arrayAhj10b_INtNtNtB7_3ops5index8IndexMutINtNtBI_5range7RangeTojEE9index_mutCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          223c: fe 0b 00 f9  	str	x30, [sp, #16]
-    00000000000022bc <_RNvXsp_NtCsgc5Frn9pZ9V_4core6resultINtB5_6ResultilEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfalliblelEE13from_residualCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          22c4: fe 23 00 f9  	str	x30, [sp, #64]
-    00000000000023b0 <_RNvYNvYjNtNtCsgc5Frn9pZ9V_4core3cmp3Ord3cmpINtNtNtBa_3ops8function6FnOnceTRjB1a_EE9call_onceCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          23b8: fe 0b 00 f9  	str	x30, [sp, #16]
-    00000000000023e0 <_RNvYjNtNtCsgc5Frn9pZ9V_4core3cmp3Ord3minCsd8Bjm28kwoH_21test_ashmem_asan_ctor>:
-          23e4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000002400 <_RNvMCsd8Bjm28kwoH_21test_ashmem_asan_ctorNtB2_15UserSliceReader8read_all>:
-          2408: fe 43 00 f9  	str	x30, [sp, #128]
-    0000000000002570 <_RNvMs_Csd8Bjm28kwoH_21test_ashmem_asan_ctorNtB4_15UserSliceWriter9write_all>:
-          2578: fe 4b 00 f9  	str	x30, [sp, #144]
-    0000000000003490 <_RNvMs2_Csd8Bjm28kwoH_21test_ashmem_asan_ctorNtB5_6Ashmem8set_size>:
-          3498: fe 2b 00 f9  	str	x30, [sp, #80]
-    00000000000035d4 <_RNvMs2_Csd8Bjm28kwoH_21test_ashmem_asan_ctorNtB5_6Ashmem8get_size>:
-          35dc: fe 1b 00 f9  	str	x30, [sp, #48]
-    0000000000003648 <_RNvMs2_Csd8Bjm28kwoH_21test_ashmem_asan_ctorNtB5_6Ashmem13set_prot_mask>:
-          3650: fe 33 00 f9  	str	x30, [sp, #96]
-    00000000000037dc <_RNvMs2_Csd8Bjm28kwoH_21test_ashmem_asan_ctorNtB5_6Ashmem13get_prot_mask>:
-          37e4: fe 1b 00 f9  	str	x30, [sp, #48]
-    0000000000003e98 <_RNvCsd8Bjm28kwoH_21test_ashmem_asan_ctor20shrinker_should_stop>:
-          3ea0: fe 0b 00 f9  	str	x30, [sp, #16]
-    0000000000003ed4 <is_ashmem_file>:
-          3edc: fe 13 00 f9  	str	x30, [sp, #32]
-    0000000000003f68 <_RNvCsd8Bjm28kwoH_21test_ashmem_asan_ctor12shrink_count>:
-          3f70: fe 0b 00 f9  	str	x30, [sp, #16]
-    0000000000003f9c <_RNvCsd8Bjm28kwoH_21test_ashmem_asan_ctor11shrink_scan>:
-          3fa4: fe 1b 00 f9  	str	x30, [sp, #48]
-    0000000000000000 <asan.module_ctor>:
-             4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000000000 <asan.module_dtor>:
-             4: fe 0f 1f f8  	str	x30, [sp, #-16]!
+    ASHMEM_FOPS_PTR.store(0x1000 as *mut u8, Ordering::Relaxed);
 
-  asan.module_ctor prologue:
-    0000000000000000 <asan.module_ctor>:
-           0: 3f 23 03 d5  	hint	#25
-           4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-           8: 00 00 00 90  	adrp	x0, 0x0 <asan.module_ctor+0x8>
-           c: 00 00 00 91  	add	x0, x0, #0
-          10: 08 06 80 52  	mov	w8, #48
-          14: e1 03 08 2a  	mov	w1, w8
-          18: 00 00 00 94  	bl	0x18 <asan.module_ctor+0x18>
-          1c: fe 07 41 f8  	ldr	x30, [sp], #16
+    let cmds: [(u32, usize); 11] = [
+        (0x4100_7701, 0x2000),
+        (0x8100_7702, 0x3000),
+        (0x4008_7703, 4096),
+        (0x0000_7704, 0),
+        (0x4004_7705, 0x3),
+        (0x0000_7706, 0),
+        (0x4008_7707, 0x4000),
+        (0x4008_7708, 0x5000),
+        (0x0000_7709, 0x6000),
+        (0x0000_770A, 0),
+        (0xDEAD, 0),
+    ];
 
-═══════════════════════════════════════════════════════════
-  KASAN WITH -Cforce-frame-pointers=yes (proposed fix)
-═══════════════════════════════════════════════════════════
+    let mut i = 0;
+    while i < cmds.len() {
+        let (cmd, arg) = cmds[i];
+        match Ashmem::ioctl(pinned, cmd, arg) {
+            Ok(v) => r = r.wrapping_add(v),
+            Err(e) => r = r.wrapping_add(e as isize),
+        }
+        i += 1;
+    }
 
-  Total functions          : 58
-  paciasp (PAC-RET)        : 0
-  stp x29, x30 (GOOD)     : 56
-  str x30       (BAD)     : 2
-  asan.module_ctor present : YES
+    r = r.wrapping_add(shrinker_should_stop() as isize);
+    r = r.wrapping_add(shrink_count() as isize);
+    r = r.wrapping_add(shrink_scan(10) as isize);
+    r = r.wrapping_add(unsafe { is_ashmem_file(null_mut()) } as isize);
 
-  *** str x30 sites: ***
-    0000000000000000 <asan.module_ctor>:
-             4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-    0000000000000000 <asan.module_dtor>:
-             4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-
-  asan.module_ctor prologue:
-    0000000000000000 <asan.module_ctor>:
-           0: 3f 23 03 d5  	hint	#25
-           4: fe 0f 1f f8  	str	x30, [sp, #-16]!
-           8: 00 00 00 90  	adrp	x0, 0x0 <asan.module_ctor+0x8>
-           c: 00 00 00 91  	add	x0, x0, #0
-          10: 08 06 80 52  	mov	w8, #48
-          14: e1 03 08 2a  	mov	w1, w8
-          18: 00 00 00 94  	bl	0x18 <asan.module_ctor+0x18>
-          1c: fe 07 41 f8  	ldr	x30, [sp], #16
-
-═══════════════════════════════════════════════════════════
-  VERDICT
-═══════════════════════════════════════════════════════════
-
-  baseline (no KASAN)     : 0 str x30
-  KASAN (no FP flag)      : 39 str x30
-  KASAN (with FP flag)    : 2 str x30
-
-  RESULT: asan.module_ctor IGNORES -Cforce-frame-pointers=yes
-
-  Two bugs:
-  1. Kernel: KBUILD_RUSTFLAGS missing -Cforce-frame-pointers=yes
-     → fixes user functions but not asan.module_ctor
-  2. LLVM: asan.module_ctor skips frame-pointer=all attribute
-     → file at https://github.com/llvm/llvm-project/issues
-
-═══════════════════════════════════════════════════════════
+    r
+                    }

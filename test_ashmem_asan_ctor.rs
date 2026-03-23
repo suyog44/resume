@@ -50,10 +50,29 @@
 #![no_std]
 #![allow(
     missing_docs,
-    clippy::all,
+    non_ascii_idents,
+    unsafe_op_in_unsafe_fn,
+    rust_2018_idioms,
     unreachable_pub,
+    clippy::all,
+    clippy::ignored_unit_patterns,
+    clippy::mut_mut,
+    clippy::needless_bitwise_bool,
+    clippy::needless_lifetimes,
+    clippy::no_mangle_with_rust_abi,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_safety_comment,
+    clippy::unnecessary_safety_doc,
+    clippy::float_arithmetic,
     rustdoc::missing_crate_level_docs,
-    rustdoc::unescaped_backticks
+    rustdoc::unescaped_backticks,
+    dead_code,
+    unused_variables,
+    unused_imports,
+    unused_mut,
+    unused_assignments,
+    unused_unsafe,
+    stable_features
 )]
 
 use core::{
